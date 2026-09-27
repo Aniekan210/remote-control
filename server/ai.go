@@ -10,9 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -22,47 +20,6 @@ const aiLogPrefix = "[ai] "
 
 func aiLogf(format string, args ...any) {
 	log.Printf(aiLogPrefix+format, args...)
-}
-
-// ────────────────────────────────────────
-// GLOBAL RATE LIMITER
-// ────────────────────────────────────────
-// OpenRouter's shared upstream pools (Parasail etc.) 429 aggressively when
-// two requests land back-to-back — and our planning→execution flow naturally
-// fires one call per ADVANCE with no gap. This serializes *all* outbound
-// OpenRouter calls through a single gate and guarantees a minimum spacing
-// between them, so a task that runs 10 instructions doesn't trip the limit
-// on instruction 3.
-//
-// Default is 1500ms; override with AI_MIN_REQUEST_INTERVAL_MS (e.g. "3000"
-// if you're still getting 429s on a busy shared pool).
-var (
-	aiRateMu        sync.Mutex
-	aiLastCallStart time.Time
-)
-
-func aiMinInterval() time.Duration {
-	if v := os.Getenv("AI_MIN_REQUEST_INTERVAL_MS"); v != "" {
-		if ms, err := strconv.Atoi(v); err == nil && ms >= 0 {
-			return time.Duration(ms) * time.Millisecond
-		}
-	}
-	return 1500 * time.Millisecond
-}
-
-// waitForRateLimit blocks until at least aiMinInterval() has elapsed since
-// the previous OpenRouter call started, then claims the slot. Call this
-// immediately before every http.DefaultClient.Do() to OpenRouter.
-func waitForRateLimit(callID string) {
-	aiRateMu.Lock()
-	defer aiRateMu.Unlock()
-
-	wait := aiMinInterval() - time.Since(aiLastCallStart)
-	if wait > 0 {
-		aiLogf("[%s] rate-limit gate: sleeping %s before next OpenRouter call", callID, wait)
-		time.Sleep(wait)
-	}
-	aiLastCallStart = time.Now()
 }
 
 const (
@@ -315,11 +272,6 @@ screenshot, and you output the exact sequence of physical mouse and keyboard
 actions that carries out that one instruction. Do not explain anything;
 return only the JSON.
 
-Your output is parsed by json.Unmarshal into a []Execution — if ANY element
-of the "response" array is not a complete object with all five fields, the
-whole response is rejected and the task fails. Treat malformed JSON as a
-total failure, not a cosmetic issue.
-
 ────────────────────────────────────────
 TARGET ENVIRONMENT — WINDOWS
 ────────────────────────────────────────
@@ -408,16 +360,6 @@ Return ONLY a JSON object of exactly this shape:
 
 {"response": [ <action>, <action>, ... ]}
 
-EVERY ARRAY ELEMENT MUST BE AN OBJECT.
-The "response" array contains ONLY complete JSON objects { ... }. It must
-NEVER contain bare strings, field names by themselves, loose numbers, or
-bare true/false. If you catch yourself writing something like
-    "key_string", "Camera", "mouse_hold", false
-as a standalone element of the array, that is a BUG — those field names
-and values belong INSIDE a single {"type":"KEYBOARD_INPUT", ...} object,
-not next to one. Before emitting, check every element of "response":
-is it { ... } with all five keys? If not, fix it.
-
 Each <action> uses EXACTLY these five field names — no others:
 
   "type"         one of: "MOUSE_MOVEMENT" | "LEFT_CLICK" | "RIGHT_CLICK" | "KEYBOARD_INPUT"
@@ -427,23 +369,7 @@ Each <action> uses EXACTLY these five field names — no others:
   "mouse_hold"   boolean  — true ONLY to hold the button down during a drag
 
 Do NOT use "action", "x", "y", or "text". The keys are exactly "type",
-"mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold". Every action
-object MUST contain ALL FIVE keys, even the ones that are 0 / "" / false.
-
-WRONG — array contains bare strings/values (this is the exact error to avoid):
-{"response": [
-  {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "{WIN}", "mouse_hold": false},
-  {"type": "MOUSE_MOVEMENT", "mouse_pos_x": 825, "mouse_pos_y": 307, "key_string": "", "mouse_hold": false},
-  "key_string", "Camera", "mouse_hold", false
-]}
-
-RIGHT — every array element is a complete object:
-{"response": [
-  {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "{WIN}", "mouse_hold": false},
-  {"type": "MOUSE_MOVEMENT", "mouse_pos_x": 825, "mouse_pos_y": 307, "key_string": "", "mouse_hold": false},
-  {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "Camera", "mouse_hold": false},
-  {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "{ENTER}", "mouse_hold": false}
-]}
+"mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold".
 
 ────────────────────────────────────────
 MOUSE RULES
@@ -589,10 +515,6 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-
-	// Space outbound calls so consecutive planning/execution requests don't
-	// hit OpenRouter's upstream provider limit back-to-back.
-	waitForRateLimit(callID)
 
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
