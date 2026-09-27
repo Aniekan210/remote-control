@@ -10,19 +10,14 @@ type RoomRequest struct {
 	DeviceID string `json:"device_id"`
 }
 
-// Item represents an entity in our master hash table
 type Task struct {
-	DeviceID                string        `json:"device_id"`
-	Description             string        `json:"description"` // the task the user said
-	Status                  string        `json:"status"`      // RUNNING / COMPLETED / PAUSED / CANCELLED / NONE
-	CurrentInstructionIndex int           `json:"current_instruction_index"`
-	InstructionList         []Instruction `json:"instruction_list"` // list of instructions from initial AI breakdown
-	ExecutionList           []Execution   `json:"execution_list"`   // list of executions after AI solves singular instruction
-	Context                 bool          `json:"context"`          // boolean asking for context from the desktop worker
-}
-
-type Instruction struct {
-
+	DeviceID                string      `json:"device_id"`
+	Description             string      `json:"description"` // the task the user said
+	Status                  string      `json:"status"`      // RUNNING / COMPLETED / PAUSED / CANCELLED / NONE
+	CurrentInstructionIndex int         `json:"current_instruction_index"`
+	InstructionList         []string    `json:"instruction_list"` // list of instructions from initial AI breakdown
+	ExecutionList           []Execution `json:"execution_list"`   // list of executions after AI solves singular instruction
+	Context                 bool        `json:"context"`          // boolean asking for context from the desktop worker
 }
 
 type Execution struct {
@@ -30,6 +25,7 @@ type Execution struct {
 	KeyString string `json:"key_string"`  // the string that the keyboard is to input
 	MousePosX int    `json:"mouse_pos_x"` // the x position the mouse is to move to
 	MousePosY int    `json:"mouse_pos_y"` // the y position the mouse is to move to
+	MouseHold bool   `json:"mouse_hold"`  // true to hold current click and true if you want to move the mouse with the click, false next execution to release
 }
 
 type Action struct {
@@ -37,7 +33,7 @@ type Action struct {
 	DeviceID          string      `json:"device_id"`           // for CREATE_TASK
 	Description       string      `json:"description"`         // for CREATE_TASK
 	FileSystemPayload []FileEntry `json:"file_system_payload"` // for ADVANCE
-	ScreenshotPayload Screenshot  `json:"screenshot_payload"`  
+	ScreenshotPayload Screenshot  `json:"screenshot_payload"`
 }
 
 type FileEntry struct {

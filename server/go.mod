@@ -1,5 +1,8 @@
-module github.com/Aniekan210/remote-control/server
+module remotecontrolserver
 
-go 1.25.0
+go 1.24.7
 
-require github.com/coder/websocket v1.8.15 // indirect
+require (
+	github.com/coder/websocket v1.8.15
+	github.com/joho/godotenv v1.5.1
+)
