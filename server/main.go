@@ -191,6 +191,29 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				taskID, task.Context, task.CurrentInstructionIndex, len(task.InstructionList),
 				len(action.ScreenshotPayload.Data), len(action.FileSystemPayload))
 
+			// If the worker has just finished the final execution,
+			// this ADVANCE means the task is now actually complete.
+			// Do not make another AI call.
+			if !task.Context && task.CurrentInstructionIndex >= len(task.InstructionList) {
+				task.Status = "COMPLETED"
+				task.ExecutionList = make([]Execution, 0)
+
+				srvLogf("device=%s: all instructions executed, task COMPLETED", taskID)
+
+				taskHashTable[taskID] = task
+
+				clients := make([]*websocket.Conn, 0, len(rooms[taskID]))
+				for client := range rooms[taskID] {
+					clients = append(clients, client)
+				}
+
+				mutex.Unlock()
+
+				broadcastToTaskRoom(r.Context(), taskID, task, clients)
+				continue
+			}
+
+			// Release the lock before the network call so a slow request
 			// Release the lock before the network call so a slow request
 			// (or our retries) don't block every other room's messages
 			// from being processed while we wait on the AI.
@@ -265,8 +288,8 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				}
 
 			default:
-				// Execution call: result is the execution list for the
-				// current instruction.
+				// Execution call: result is the execution list for
+				// the current instruction.
 				executions, ok := result.([]Execution)
 				if !ok {
 					srvLogf("device=%s: expected []Execution from execution call, got %T (value: %+v) — resetting task",
@@ -274,15 +297,12 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 					task = resetTask(task.DeviceID)
 					break
 				}
+
 				task.ExecutionList = executions
 				task.CurrentInstructionIndex++
+
 				srvLogf("device=%s: execution list set (%d actions) for instruction %d/%d: %+v",
 					taskID, len(executions), task.CurrentInstructionIndex, len(task.InstructionList), executions)
-
-				if task.CurrentInstructionIndex >= len(task.InstructionList) {
-					task.Status = "COMPLETED"
-					srvLogf("device=%s: all instructions done, task COMPLETED", taskID)
-				}
 			}
 
 		case "PAUSE_TASK":
