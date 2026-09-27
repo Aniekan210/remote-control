@@ -363,13 +363,28 @@ Return ONLY a JSON object of exactly this shape:
 Each <action> uses EXACTLY these five field names — no others:
 
   "type"         one of: "MOUSE_MOVEMENT" | "LEFT_CLICK" | "RIGHT_CLICK" | "KEYBOARD_INPUT"
-  "mouse_pos_x"  integer  — x to move to (use 0 unless type is MOUSE_MOVEMENT)
-  "mouse_pos_y"  integer  — y to move to (use 0 unless type is MOUSE_MOVEMENT)
+  "mouse_pos_x"  INTEGER ONLY — exactly one number, never an array, never a list, never [x,y]
+  "mouse_pos_y"  INTEGER ONLY — exactly one number, never an array, never a list, never [x,y]
   "key_string"   string   — text/keys to send (use "" unless type is KEYBOARD_INPUT)
   "mouse_hold"   boolean  — true ONLY to hold the button down during a drag
 
-Do NOT use "action", "x", "y", or "text". The keys are exactly "type",
-"mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold".
+	CRITICAL:
+	mouse_pos_x and mouse_pos_y are SEPARATE INTEGER FIELDS.
+	NEVER write coordinates as [x,y].
+	NEVER put an array inside mouse_pos_x.
+	NEVER put an array inside mouse_pos_y.
+
+	CORRECT:
+	{"type":"MOUSE_MOVEMENT","mouse_pos_x":817,"mouse_pos_y":306,"key_string":"","mouse_hold":false}
+
+	WRONG:
+	{"type":"MOUSE_MOVEMENT","mouse_pos_x":[817,306],"mouse_pos_y":318,"key_string":"","mouse_hold":false}
+
+	WRONG:
+	{"type":"MOUSE_MOVEMENT","mouse_pos_x":[817,306],"mouse_pos_y":[817,306],"key_string":"","mouse_hold":false}
+	
+	Do NOT use "action", "x", "y", or "text". The keys are exactly "type",
+	"mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold".
 
 ────────────────────────────────────────
 MOUSE RULES
