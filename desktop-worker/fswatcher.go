@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
@@ -45,14 +46,25 @@ func (s *SnapshotStore) remove(path string) {
 }
 
 // Snapshot returns a point-in-time copy suitable for JSON-serializing into
-// an Action's FileSystemPayload.
+// an Action's FileSystemPayload, SORTED NEWEST-FIRST by modification time.
+//
+// The ordering matters a lot: the underlying store is a map, which Go
+// iterates in random order, so without this the planner would receive the
+// files as an unordered jumble and could not answer "open the most recent
+// screenshot" — it would just grab the first file that looked like a match.
+// Newest-first means the freshly-created file the user is almost certainly
+// asking about sits right at the top of the list.
 func (s *SnapshotStore) Snapshot() []FileEntry {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	out := make([]FileEntry, 0, len(s.entries))
 	for _, e := range s.entries {
 		out = append(out, e)
 	}
+	s.mu.RUnlock()
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ModTime > out[j].ModTime // most recently modified first
+	})
 	return out
 }
 
@@ -112,16 +124,21 @@ func RunFSWatcher(ctx context.Context, roots []string, store *SnapshotStore) {
 			if !ok {
 				return
 			}
-			switch {
-			case event.Op&(fsnotify.Remove|fsnotify.Rename) != 0:
-				store.remove(event.Name)
-			default: // Create, Write, Chmod
-				if info, err := os.Stat(event.Name); err == nil {
-					store.upsert(event.Name, info)
-					if info.IsDir() {
-						_ = watcher.Add(event.Name) // start watching newly created dirs
-					}
+			// Stat-based, not op-based: whatever the event says, the ground
+			// truth is whether the path exists NOW. If it does, it was
+			// created/written/renamed-into-place → upsert; if it doesn't, it
+			// was removed/renamed-away → remove. This fixes a real bug where
+			// a Rename event (fired when a file is renamed INTO this name —
+			// exactly how some screenshot tools save, temp file then rename)
+			// was treated as a delete, dropping the brand-new file the user
+			// is most likely about to ask about.
+			if info, err := os.Stat(event.Name); err == nil {
+				store.upsert(event.Name, info)
+				if info.IsDir() && event.Op&fsnotify.Create != 0 {
+					_ = watcher.Add(event.Name) // watch newly created dirs
 				}
+			} else {
+				store.remove(event.Name)
 			}
 
 		case err, ok := <-watcher.Errors:

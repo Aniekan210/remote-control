@@ -37,8 +37,9 @@ func ShowPairingUI(deviceID string) {
 		return
 	}
 	htmlPath := filepath.Join(appDir, "pairing.html")
+	controlURL := "https://control.aniekan.dev?device=" + deviceID
 
-	png, err := qrcode.Encode(deviceID, qrcode.Medium, 320)
+	png, err := qrcode.Encode(controlURL, qrcode.Medium, 320)
 	if err != nil {
 		log.Printf("pairing: failed to generate QR code: %v", err)
 		return

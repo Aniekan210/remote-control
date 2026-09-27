@@ -40,14 +40,16 @@ const (
 	acSrcOver  = 0x00
 	acSrcAlpha = 0x01
 
-	// Frame geometry.
-	glowThickness = 90  // px the edge glow reaches inward
-	glowMaxAlpha  = 70  // peak glow alpha at the very edge (kept subtle)
-	edgeLineWidth = 2   // crisp bright line right at the screen edge
-	edgeLineAlpha = 200 //
-	bracketLength = 120 // length of each corner bracket arm
-	bracketThick  = 4   // thickness of the bracket arms
-	bracketAlpha  = 255 // corner brackets are the brightest element
+	// Frame geometry — strong neon HUD: a bold inward glow, a bright crisp
+	// edge line, and prominent corner brackets. This is the whole overlay
+	// now (there's no status panel), so it carries all the visual weight.
+	glowThickness = 150 // px the glow reaches inward (broad, luminous wash)
+	glowMaxAlpha  = 130 // peak glow alpha at the very edge (strong)
+	edgeLineWidth = 3   // crisp bright line right at the screen edge
+	edgeLineAlpha = 235 // bold, well-defined frame
+	bracketLength = 170 // long, confident corner brackets
+	bracketThick  = 5   // thick arms
+	bracketAlpha  = 255 // fully opaque — the brightest accent
 )
 
 type blendFunction struct {
@@ -86,8 +88,10 @@ func frameWndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintp
 		}
 		return 0
 	case wmDestroy:
-		// The status window owns PostQuitMessage; frame resources are
-		// freed after the message loop exits (see RunOverlay).
+		// The frame is the only window now, so it owns the quit. Ending the
+		// message loop returns control to RunOverlay, which frees the frame's
+		// resources.
+		procPostQuitMessage.Call(0)
 		return 0
 	}
 	ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)

@@ -22,6 +22,37 @@ func aiLogf(format string, args ...any) {
 	log.Printf(aiLogPrefix+format, args...)
 }
 
+const (
+	// PLANNING is a reasoning + light-vision job (break the task into
+	// granular Windows steps, grounded in the screenshot). A top-tier
+	// structured reasoner with strong vision. Overridable via PLANNING_MODEL.
+	defaultPlanningModel = "google/gemini-3.1-pro-preview"
+
+	// EXECUTION is a visual-grounding job (turn one instruction + the
+	// screenshot into exact click pixels). Qwen2.5-VL is grounding-first —
+	// coordinate/point output is a trained capability, not an afterthought
+	// — which is exactly what pixel-accurate clicking needs.
+	defaultExecutionModel = "qwen/qwen2.5-vl-72b-instruct"
+)
+
+// modelForContext returns the model for the current call. planning==true
+// selects the planner, false selects the executor. Both can be overridden
+// at runtime via the PLANNING_MODEL / EXECUTION_MODEL environment
+// variables (paste any OpenRouter model slug) so models can be swapped
+// without a rebuild.
+func modelForContext(planning bool) string {
+	if planning {
+		if m := os.Getenv("PLANNING_MODEL"); m != "" {
+			return m
+		}
+		return defaultPlanningModel
+	}
+	if m := os.Getenv("EXECUTION_MODEL"); m != "" {
+		return m
+	}
+	return defaultExecutionModel
+}
+
 func sendMessage(task Task, action Action) (any, error) {
 	// callID ties every log line for this one call together, so concurrent
 	// tasks' logs don't get interleaved into something unreadable — grep
@@ -41,115 +72,157 @@ func sendMessage(task Task, action Action) (any, error) {
 
 	if task.Context {
 		systemPrompt = `
-You are a task planning agent for a computer-control system.
+You are the PLANNING agent for a computer-control system that operates a
+MICROSOFT WINDOWS computer on the user's behalf. You decide WHAT should
+happen, step by step. A separate execution agent decides HOW (the physical
+clicks and keystrokes) — so you never describe mouse or keyboard actions.
 
-Break the user's task into a sequence of simple, granular instructions
-that another AI will execute one at a time.
+Your job: turn the user's task into an ordered list of small, single-purpose
+instructions, each describing exactly one meaningful change to the computer's
+state, grounded in what is actually on screen right now.
 
-Use:
-- The task description
-- The filesystem information
-- The current screenshot
+────────────────────────────────────────
+TARGET ENVIRONMENT — WINDOWS
+────────────────────────────────────────
+- The machine runs Microsoft Windows. Plan the way things are really done on
+  Windows: the Start menu, the taskbar, the desktop, and Windows apps.
+- Applications are opened by name via the Start menu (Windows key → type the
+  name → Enter). You do not need file paths or shell commands to launch apps.
+- Prefer the simplest reliable Windows path to each outcome.
 
-Each instruction MUST:
-- Be one simple sentence.
-- Have exactly one clear meaning.
-- Cause only one meaningful visual or application-state change.
-- Be independently understandable.
-- Describe what should happen, not how to physically perform it.
+────────────────────────────────────────
+GROUND EVERY STEP IN THE CURRENT SCREENSHOT
+────────────────────────────────────────
+Before writing the plan, read the screenshot and note the real starting
+state: which app is focused, whether a window is maximized and covering the
+screen, and whether the taskbar and desktop are visible.
 
-Do NOT combine multiple actions or state changes into one instruction.
+- Start from the state actually shown — never from an imagined clean desktop.
+- CLEAR THE WAY FIRST. If a window is currently maximized or covering the
+  screen and the task's next move is to launch or switch to a DIFFERENT app,
+  make your FIRST instruction "Minimize the current window to reveal the
+  desktop and taskbar." (or "Show the desktop." to clear everything). This
+  gives a clean, predictable surface before opening anything new.
+- ENSURE THE TASKBAR IS AVAILABLE. If the taskbar is hidden or not visible in
+  the screenshot, include "Reveal the Windows taskbar." before any step that
+  relies on the Start button or taskbar.
+- Do NOT include steps for state that is already true (e.g. don't say "Open
+  the Start menu." if it is already open, or "Show the desktop." if the
+  desktop is already clear).
 
-GRANULARITY
+────────────────────────────────────────
+BE GRANULAR — RELIABILITY OVER BREVITY
+────────────────────────────────────────
+Your single most important job is RELIABILITY, not efficiency. Do NOT try to
+keep the plan short. A LONG list of small, simple, individually-verifiable
+steps is BETTER than a short list of big ones, because the executor gets a
+fresh screenshot before every step — so more, smaller steps means more
+chances to observe the real screen and stay on track. When in doubt, SPLIT.
+Err on the side of MORE steps. A genuinely multi-part task should usually be
+around 8–14 steps, not 3–5.
 
-Each instruction should represent one meaningful change to the computer.
+THE SPLITTING RULE: give a separate instruction to each distinct change in
+what is on screen. Split on ALL of these — each is its own step:
+  - an app/window opening, closing, or coming to the front
+  - a page navigating or loading new content
+  - a new browser tab opening
+  - a menu, panel, dialog, sidebar, popup, or overlay appearing or closing
+  - switching to a different window or app
+  - a file, folder, or document opening
+  - FOCUSING an input (search box, address bar, text field) — its own step
+  - ENTERING text into a focused field — its own step, SEPARATE from…
+  - SUBMITTING / confirming that entry (pressing Enter, clicking a button)
+  - a list of results, suggestions, or autocomplete appearing
+  - selecting or opening one item from such a list
+  - dismissing a cookie/consent banner or other interruption
 
-For example, for:
+Split "enter text" and "submit it" into TWO steps — after typing, the screen
+usually changes (suggestions, validation) and the executor should see that
+before submitting.
 
-"Open Chrome and go to Google."
+Every instruction is ONE short, plain sentence describing the RESULT — never
+the physical action (no "move the mouse", "click", "type", "press", "scroll").
+"Focus the search box." is a result; "Click at 800,400." is not.
 
-Return:
+────────────────────────────────────────
+GRANULARITY — WORKED EXAMPLES (note how many steps)
+────────────────────────────────────────
+Task: "Search for cats on Google." — Chrome already open on another page.
+{"instructions": [
+  "Open a new browser tab.",
+  "Go to google.com.",
+  "Focus the Google search box.",
+  "Enter 'cats' in the search box.",
+  "Submit the search.",
+  "Open the top search result."
+]}
 
-["Open Google Chrome.", "Navigate to Google."]
+Task: "Play lo-fi music on YouTube." — a maximized window currently covers the
+screen.
+{"instructions": [
+  "Minimize the current window to reveal the desktop and taskbar.",
+  "Open Google Chrome.",
+  "Open a new browser tab.",
+  "Go to youtube.com.",
+  "Focus the YouTube search box.",
+  "Enter 'lofi hip hop radio' in the search box.",
+  "Submit the search.",
+  "Open the first video in the results.",
+  "Make sure the video is playing."
+]}
 
-NOT:
+Task: "Reply 'thanks!' to the newest email in Gmail." — Chrome already open.
+{"instructions": [
+  "Open a new browser tab.",
+  "Go to gmail.com.",
+  "Open the most recent email in the inbox.",
+  "Open the reply editor for that email.",
+  "Focus the reply body.",
+  "Enter 'thanks!' in the reply body.",
+  "Send the reply."
+]}
 
-["Open Google Chrome and navigate to Google."]
+Do NOT collapse these into coarse steps like ["Reply to the newest email."],
+and do NOT drop to physical actions like ["Click the Compose button."]. Aim
+for the granular middle: many small, plain, result-level steps.
 
-Another example:
+────────────────────────────────────────
+USE ALL THE CONTEXT
+────────────────────────────────────────
+- Use the screenshot for the current application and desktop state.
+- Use the filesystem information to know which files and folders exist; do
+  not invent files, folders, apps, or UI elements that aren't there.
+- Do not include steps that are already completed.
 
-"Create a file called hello.txt in the Documents folder."
+────────────────────────────────────────
+USING THE FILESYSTEM — FILES & RECENCY
+────────────────────────────────────────
+- The filesystem is a JSON array of entries, each with: path (full Windows
+  path), type (0=file, 1=directory), size, and mod_time (Unix seconds since
+  1970). It is provided SORTED NEWEST-FIRST — the most recently modified
+  files are at the TOP of the array.
+- "Current time (Unix seconds)" is given alongside it; use it to judge how
+  recent a file is (e.g. "earlier this month" vs "today").
+- For "most recent" / "last" / "latest" requests (e.g. "open the last
+  screenshot I took"), choose the entry with the LARGEST mod_time that
+  matches — screenshots are typically PNGs whose path contains
+  "Screenshot" and usually live under Pictures\Screenshots. Do NOT just pick
+  any file whose name contains the keyword; pick the newest matching one by
+  mod_time.
+- When the task refers to a specific file, resolve it against the filesystem
+  and put the EXACT file name (and its folder) into the instruction, so the
+  executor knows precisely what to open — e.g.
+  "Open the file 'Screenshot 2026-09-27 143022.png' from the
+  Pictures\Screenshots folder." Prefer opening a file directly from its
+  folder in File Explorer over guessing a path from memory.
 
-Return:
+────────────────────────────────────────
+OUTPUT
+────────────────────────────────────────
+Return ONLY a JSON object of this exact form, with no surrounding prose and
+no markdown code fences:
 
-["Open the file manager.", "Open the Documents folder.", "Create a new text file.", "Name the file hello.txt."]
-
-Do NOT return:
-
-["Open the file manager and navigate to Documents.", "Create and name a new text file hello.txt."]
-
-Another example:
-
-"Open VS Code and open main.go."
-
-Return:
-
-["Open Visual Studio Code.", "Open main.go."]
-
-Another example:
-
-"Connect with Elon Musk on LinkedIn."
-
-Return:
-
-["Open Google Chrome.", "Navigate to LinkedIn.", "Search for Elon Musk.", "Open Elon Musk's profile.", "Click the Connect button."]
-
-Do NOT return:
-
-["Open Google Chrome and navigate to LinkedIn.", "Search for Elon Musk and open his profile.", "Connect with Elon Musk."]
-
-The planner should break the task down to the smallest meaningful application
-or visual state changes required to complete it.
-
-The instruction should NOT describe individual physical operations.
-
-For example, do NOT create instructions such as:
-
-"Move the mouse to the Chrome icon."
-"Click the Chrome icon."
-"Move the mouse to the search bar."
-"Type Elon Musk."
-
-Those are physical execution details. The execution agent handles them.
-
-The instruction should instead describe the meaningful result:
-
-"Open Google Chrome."
-"Search for Elon Musk."
-
-The same applies to typing, clicking, dragging, scrolling, and keyboard
-shortcuts. Only describe the meaningful state change they are intended to
-produce.
-
-Use the screenshot to determine the current application and desktop state.
-
-Use the filesystem information to determine available files and directories.
-
-Do not include steps that have already been completed.
-
-Do not invent application state, files, or UI elements.
-
-Return the instructions in the exact order they must be completed.
-
-Each instruction must depend only on the state produced by the previous
-instructions or the state already visible in the screenshot.
-
-Return ONLY a JSON array of strings, with no surrounding prose and no
-markdown code fences.
-
-Example:
-
-["Open the file manager.", "Open the Downloads folder.", "Open the project folder.", "Open the terminal."]
+{"instructions": ["...", "..."]}
 `
 
 		fs, err := json.Marshal(action.FileSystemPayload)
@@ -158,14 +231,20 @@ Example:
 			return nil, fmt.Errorf("marshal filesystem payload: %w", err)
 		}
 
+		// The task description lives on the Task (set at CREATE_TASK), NOT on
+		// this ADVANCE action — an ADVANCE carries no Description, so reading
+		// action.Description here sends the planner an empty task and the
+		// model correctly reports "No task was provided."
 		aiLogf("[%s] planning request: task=%q filesystemEntries=%d",
-			callID, action.Description, len(action.FileSystemPayload))
+			callID, task.Description, len(action.FileSystemPayload))
 
 		userContent = []any{
 			map[string]any{
 				"type": "text",
-				"text": "Task:\n" + action.Description +
-					"\n\nFilesystem:\n" + string(fs),
+				"text": fmt.Sprintf(
+					"Task:\n%s\n\nCurrent time (Unix seconds): %d\n\nFilesystem (sorted newest-first by mod_time):\n%s",
+					task.Description, time.Now().Unix(), string(fs),
+				),
 			},
 		}
 	} else {
@@ -187,47 +266,164 @@ Example:
 		h := action.ScreenshotPayload.Height
 
 		systemPrompt = fmt.Sprintf(`
-You are a computer-control action generator.
+You are the EXECUTION agent for a computer-control system operating a
+MICROSOFT WINDOWS computer. You are given ONE instruction and the current
+screenshot, and you output the exact sequence of physical mouse and keyboard
+actions that carries out that one instruction. Do not explain anything;
+return only the JSON.
 
-Convert the given instruction into the precise sequence of physical
-mouse and keyboard actions required to complete it using the screenshot.
+────────────────────────────────────────
+TARGET ENVIRONMENT — WINDOWS
+────────────────────────────────────────
+- The machine runs Microsoft Windows. Act like a Windows user: the Start
+  button / Start menu, the taskbar, window title-bar buttons (minimize,
+  maximize, close), and normal Windows apps.
+- To OPEN an app: press the Windows key to open the Start menu, type the
+  app's name, then press Enter — e.g. one KEYBOARD_INPUT "{WIN}", one
+  KEYBOARD_INPUT "chrome", one KEYBOARD_INPUT "{ENTER}". (You may also click
+  the Start button if it is clearly visible, then type the name.)
+- To SHOW THE DESKTOP / clear windows: KEYBOARD_INPUT "{WIN+D}".
+- To MINIMIZE the current window: KEYBOARD_INPUT "{WIN+DOWN}" (or click the
+  window's minimize button if visible).
+- To SWITCH windows: KEYBOARD_INPUT "{ALT+TAB}". To CLOSE: "{ALT+F4}".
+- NEVER type shell commands (e.g. "google-chrome &"). This is not a terminal.
 
-Prioritize speed, visual accuracy, and correct execution.
-Do not explain your reasoning. Return only the structured execution list.
+────────────────────────────────────────
+CLEAR OBSTACLES FIRST (HANDLE THE UNEXPECTED)
+────────────────────────────────────────
+Before doing the instruction, LOOK at the screenshot for anything that is
+blocking or overlaying your target and would make the instruction fail. Common
+interruptions on Windows and the web:
+  - cookie / consent banners ("Accept all", "Reject all", "I agree")
+  - modal dialogs, popups, and overlays with a close (X) button
+  - "Sign in", "Continue as", or account-chooser walls over the content
+  - notification / location permission prompts ("Allow", "Block", "Not now")
+  - autoplay or promo overlays, newsletter popups, "Open in app" prompts
+  - tooltips or coach-marks covering the element
 
-The screenshot resolution is %dx%d.
-Coordinates are absolute pixel coordinates within this screenshot.
-(0,0) is the top-left corner.
-X increases rightward.
-Y increases downward.
+If such an obstacle is present AND it blocks progress toward this instruction,
+DISMISS IT FIRST (click Accept/Reject/Close/X/Not now/Dismiss — whichever
+safely gets it out of the way, preferring the least-committal option like
+"Reject all" or "Not now" unless accepting is clearly required), and THEN do
+the instruction — all in the SAME action list. Adding these extra actions is
+correct and expected; it is NOT a violation of "do only the instruction."
 
-Determine coordinates from the full screenshot as given, with no manual
-offset or correction applied.
+If the target of the instruction is simply not where you expected but IS
+visible elsewhere on screen, act on where it actually is. Do not blindly click
+a remembered location.
 
-For mouse interactions, click the center of the visible clickable area.
+────────────────────────────────────────
+RELIABILITY OVER BREVITY
+────────────────────────────────────────
+Do NOT try to minimize the number of actions. Output as MANY actions as are
+needed to complete this instruction reliably — including obstacle-clearing
+above, a MOUSE_MOVEMENT before every click, and separate keystrokes. A longer,
+safe action list that succeeds is always better than a short one that misses.
 
-Every physical mouse operation MUST be a separate execution.
+────────────────────────────────────────
+COORDINATES — BE MAXIMALLY PRECISE
+────────────────────────────────────────
+- The screenshot is EXACTLY %dx%d pixels, and it is the machine's true
+  native resolution. Your coordinates are in that same pixel space, 1:1 —
+  there is no scaling, DPI adjustment, or offset to apply. A coordinate you
+  output is the exact on-screen pixel the cursor moves to.
+- (0,0) is the top-left pixel. x increases rightward to width-1; y increases
+  downward to height-1. Every coordinate MUST fall inside the screen:
+  0 <= x < %d and 0 <= y < %d.
+- PRECISION IS THE #1 PRIORITY. Being off by even a few pixels can miss the
+  target and break the whole task. Take the coordinate seriously.
+- Use this exact method for every mouse target:
+    1. Find the target element's full bounding box in the image — its left
+       edge (x1), right edge (x2), top edge (y1), bottom edge (y2).
+    2. Compute the center: x = (x1 + x2) / 2, y = (y1 + y2) / 2.
+    3. Output that center, rounded to the nearest whole pixel.
+  Aim at the CENTER of the element's clickable body, never a corner, never an
+  edge, never the surrounding padding or label.
+- For a text field, the center of the input box itself (not its placeholder
+  text, not its label). For a button, the center of the button's filled area.
+  For an icon, the center of the icon glyph. For a list/search result, the
+  center of that row.
+- Do NOT round to convenient numbers (like 100, 500, 960). Use the real
+  measured center even if it's an odd value like 743, 391.
+- Every coordinate must fall inside the screen (the bounds given above) AND
+  inside the target element's own bounding box.
+- Measure each target independently from what is actually drawn in THIS
+  screenshot. Never reuse coordinates from memory or assume a fixed layout.
+- Only act on elements actually visible in the screenshot. Never invent
+  icons, buttons, or windows that are not shown — locate the real element and
+  click its true center.
 
-A normal click requires:
-1. MOUSE_MOVEMENT
-2. LEFT_CLICK or RIGHT_CLICK
+────────────────────────────────────────
+OUTPUT SCHEMA — STRICT
+────────────────────────────────────────
+Return ONLY a JSON object of exactly this shape:
 
-A drag requires:
-1. MOUSE_MOVEMENT to the start
-2. LEFT_CLICK with mouse_hold=true
-3. MOUSE_MOVEMENT to the destination with mouse_hold=true
-4. LEFT_CLICK with mouse_hold=false
+{"response": [ <action>, <action>, ... ]}
 
-Every keyboard operation MUST be a separate KEYBOARD_INPUT.
+Each <action> uses EXACTLY these five field names — no others:
 
-Return actions in exact physical execution order.
-Do not combine physical operations.
-Do not assume the mouse is already at the target.
-Do not invent UI elements or application state.
+  "type"         one of: "MOUSE_MOVEMENT" | "LEFT_CLICK" | "RIGHT_CLICK" | "KEYBOARD_INPUT"
+  "mouse_pos_x"  integer  — x to move to (use 0 unless type is MOUSE_MOVEMENT)
+  "mouse_pos_y"  integer  — y to move to (use 0 unless type is MOUSE_MOVEMENT)
+  "key_string"   string   — text/keys to send (use "" unless type is KEYBOARD_INPUT)
+  "mouse_hold"   boolean  — true ONLY to hold the button down during a drag
 
-Return ONLY: {"response": [...]}
-With no surrounding prose and no markdown code fences.
-`, w, h)
+Do NOT use "action", "x", "y", or "text". The keys are exactly "type",
+"mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold".
+
+────────────────────────────────────────
+MOUSE RULES
+────────────────────────────────────────
+- Each physical operation is its own action, in execution order.
+- A normal click is TWO actions: MOUSE_MOVEMENT to the target, then
+  LEFT_CLICK (or RIGHT_CLICK). mouse_hold is false for both.
+- ALWAYS MOUSE_MOVEMENT before a click — never assume the cursor is already
+  in place.
+- A drag is FOUR actions: MOUSE_MOVEMENT to start; LEFT_CLICK mouse_hold=true;
+  MOUSE_MOVEMENT to destination mouse_hold=true; LEFT_CLICK mouse_hold=false.
+
+────────────────────────────────────────
+KEYBOARD RULES
+────────────────────────────────────────
+- KEYBOARD_INPUT sends the contents of key_string. Plain text is typed
+  literally: {"type":"KEYBOARD_INPUT","key_string":"hello world","mouse_pos_x":0,"mouse_pos_y":0,"mouse_hold":false}
+- Special keys and chords go in {curly braces} inside key_string:
+    {WIN}         Windows key (opens the Start menu)
+    {ENTER} {TAB} {ESC} {BACKSPACE} {DELETE} {SPACE}
+    {UP} {DOWN} {LEFT} {RIGHT} {HOME} {END} {PAGEUP} {PAGEDOWN}
+    {F1}..{F12}
+    Chords with +: {WIN+D} (show desktop), {WIN+DOWN} (minimize),
+    {ALT+TAB} (switch window), {ALT+F4} (close), {CTRL+A}, {CTRL+C},
+    {CTRL+V}, {CTRL+S}, {CTRL+SHIFT+ESC}, etc.
+- You may mix literal text and keys in one key_string, e.g.
+  "chrome{ENTER}" types "chrome" then presses Enter.
+- Prefer keyboard for launching/switching/closing apps and for text entry;
+  prefer mouse for clicking specific on-screen targets (links, buttons,
+  fields).
+
+────────────────────────────────────────
+EXAMPLES
+────────────────────────────────────────
+Instruction: "Open Google Chrome."
+{"response": [
+  {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "{WIN}", "mouse_hold": false},
+  {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "chrome", "mouse_hold": false},
+  {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "{ENTER}", "mouse_hold": false}
+]}
+
+Instruction: "Minimize the current window to reveal the desktop and taskbar."
+{"response": [
+  {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "{WIN+D}", "mouse_hold": false}
+]}
+
+Instruction: "Click the Sign in button." (button visible at ~1650,240)
+{"response": [
+  {"type": "MOUSE_MOVEMENT", "mouse_pos_x": 1650, "mouse_pos_y": 240, "key_string": "", "mouse_hold": false},
+  {"type": "LEFT_CLICK", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "", "mouse_hold": false}
+]}
+
+Return ONLY the JSON object, with no surrounding prose and no markdown code fences.
+`, w, h, w, h)
 
 		instruction := task.InstructionList[task.CurrentInstructionIndex]
 
@@ -261,7 +457,12 @@ With no surrounding prose and no markdown code fences.
 		},
 	})
 
-	const model = "deepseek/deepseek-v4.1-flash"
+	// Two models, one per job: a strong reasoner for PLANNING (decomposing
+	// the task into granular Windows steps) and a grounding-first vision
+	// model for EXECUTION (turning one instruction + the screenshot into
+	// precise click coordinates). Both are overridable by env var so you
+	// can A/B different models without recompiling.
+	model := modelForContext(task.Context)
 
 	requestBody := map[string]any{
 		"model": model,
@@ -386,9 +587,8 @@ With no surrounding prose and no markdown code fences.
 	}
 
 	if task.Context {
-		var instructions []string
-
-		if err := json.Unmarshal([]byte(response), &instructions); err != nil {
+		instructions, err := parseInstructionList(response)
+		if err != nil {
 			aiLogf("[%s] FAILED invalid instruction list: %v, cleaned response: %s", callID, err, response)
 			return nil, fmt.Errorf("invalid instruction list: %w (raw: %s)", err, response)
 		}
@@ -406,13 +606,73 @@ With no surrounding prose and no markdown code fences.
 		return nil, fmt.Errorf("invalid execution list: %w (raw: %s)", err, response)
 	}
 
+	// Validate the decoded actions. This is the safety net for the failure
+	// that silently produced six empty actions before: json.Unmarshal does
+	// NOT error when the model uses the wrong field names (e.g. "action"/
+	// "x"/"y"/"text" instead of "type"/"mouse_pos_x"/...) — it just leaves
+	// every field at its zero value. An action with an empty/unknown Type is
+	// that exact symptom, so we reject it here and let the caller retry
+	// (with the corrected, schema-explicit prompt) instead of sending the
+	// worker a list of no-op clicks at (0,0).
 	if len(executions.Response) == 0 {
-		aiLogf("[%s] WARNING: model returned an empty execution list — the worker will have nothing to do and this instruction will silently never advance", callID)
+		aiLogf("[%s] FAILED model returned an empty execution list, cleaned response: %s", callID, response)
+		return nil, fmt.Errorf("empty execution list (raw: %s)", response)
+	}
+	for i, e := range executions.Response {
+		switch e.Type {
+		case "MOUSE_MOVEMENT", "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT":
+			// valid
+		default:
+			aiLogf("[%s] FAILED execution %d has invalid/empty type %q — the model almost certainly used the wrong JSON field names (expected type/mouse_pos_x/mouse_pos_y/key_string/mouse_hold); cleaned response: %s",
+				callID, i, e.Type, response)
+			return nil, fmt.Errorf("execution %d has invalid/empty type %q (raw: %s)", i, e.Type, response)
+		}
 	}
 
 	aiLogf("[%s] SUCCESS execution: %d actions: %+v", callID, len(executions.Response), executions.Response)
 
 	return executions.Response, nil
+}
+
+// parseInstructionList extracts the planner's list of instructions from
+// the model's JSON, tolerant of the two shapes it realistically returns:
+//
+//  1. a bare array — ["Open Chrome.", "Search."]
+//  2. an object wrapping the array — {"instructions": [...]} (which is what
+//     response_format:json_object nudges the model toward), or the same
+//     under a differently-named key.
+//
+// Being tolerant here matters because the model is not perfectly
+// consistent about which shape it emits; keying the whole pipeline on one
+// exact shape is what made planning fail intermittently before.
+func parseInstructionList(response string) ([]string, error) {
+	// 1) Bare array.
+	var arr []string
+	if err := json.Unmarshal([]byte(response), &arr); err == nil {
+		return arr, nil
+	}
+
+	// 2) Object wrapping the array. Try the expected/likely keys first, then
+	// fall back to the first value that is itself an array of strings.
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(response), &obj); err != nil {
+		return nil, fmt.Errorf("response is neither a JSON string array nor an object: %w", err)
+	}
+	for _, key := range []string{"instructions", "response", "steps", "plan", "tasks", "actions"} {
+		if raw, ok := obj[key]; ok {
+			var out []string
+			if err := json.Unmarshal(raw, &out); err == nil {
+				return out, nil
+			}
+		}
+	}
+	for _, raw := range obj {
+		var out []string
+		if err := json.Unmarshal(raw, &out); err == nil {
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("no array of instruction strings found in response object")
 }
 
 // cleanJSONResponse strips markdown code fences that some models add

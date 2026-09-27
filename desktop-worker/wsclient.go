@@ -39,6 +39,15 @@ func RunWSClient(ctx context.Context, wsURL string, state *State, changes chan<-
 
 		log.Printf("wsclient: connected")
 		backoff = time.Second
+
+		// The default coder/websocket read limit is 32 KiB. TASK_UPDATE
+		// broadcasts are small, but raise it far past that so a large
+		// payload never trips a StatusMessageTooBig close — the server
+		// sets the matching limit for the ADVANCE screenshots we send it.
+		// 256 MiB is vastly more than any single message needs; it's a
+		// safety ceiling, not an allocation.
+		conn.SetReadLimit(256 << 20)
+
 		state.SetConn(conn)
 
 		readLoop(ctx, conn, state, changes)
@@ -69,8 +78,34 @@ func readLoop(ctx context.Context, conn *websocket.Conn, state *State, changes c
 		if !changed {
 			continue
 		}
+		// A genuinely user-driven update (resume, cancel, or a new task) is
+		// the explicit signal that clears a human-takeover HOLD. Ordinary
+		// task-progression updates (a fresh execution list, same RUNNING
+		// status) are NOT treated as resume, so an in-flight AI result can't
+		// silently cancel a takeover pause. This runs on the wsclient
+		// goroutine, so it works even while the executor is blocked in Gate().
+		if isUserResumeSignal(prev, update.Payload) {
+			takeover.ServerResume()
+		}
 		changes <- TaskChange{Prev: prev, Cur: update.Payload}
 	}
+}
+
+// isUserResumeSignal reports whether a task update reflects an explicit
+// person-driven command (rather than automatic task progression):
+//   - resuming a paused task (PAUSED -> RUNNING),
+//   - cancelling / resetting a task (-> NONE or CANCELLED),
+//   - starting a fresh task (a new plan: RUNNING with Context still true).
+func isUserResumeSignal(prev, cur Task) bool {
+	switch cur.Status {
+	case "NONE", "CANCELLED":
+		return true
+	case "RUNNING":
+		if prev.Status == "PAUSED" || cur.Context {
+			return true
+		}
+	}
+	return false
 }
 
 // SendAction writes an Action to whatever connection is currently active.

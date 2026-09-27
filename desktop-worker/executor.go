@@ -1,8 +1,44 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"os"
+	"strconv"
+	"time"
 )
+
+// interActionDelay is a short pause left after each physical action within
+// one instruction's execution list. Actions in a single list run back to
+// back with no screenshot between them, so the UI needs a beat to catch up
+// — e.g. after {WIN} the Start menu must actually open before the next
+// action types into it, otherwise the keystrokes are dropped. This is well
+// below the per-step AI round-trip (seconds), so it doesn't make the agent
+// feel slow; raise it if a machine is sluggish, lower it for snappier runs.
+const interActionDelay = 120 * time.Millisecond
+
+// Screen-settle timings for the ADVANCE screenshot. Every screenshot that
+// drives the next step waits for the screen to stop changing first, so the
+// AI never reasons about a half-loaded page. All three are overridable by
+// env var (milliseconds) for slow or fast machines/networks:
+//
+//	SETTLE_INITIAL_MS  minimum wait before checking (lets a load begin)
+//	SETTLE_POLL_MS     how often to re-check for stability
+//	SETTLE_MAX_MS      hard cap so a constantly-animating screen can't hang
+var (
+	settleInitial = envDuration("SETTLE_INITIAL_MS", 400*time.Millisecond)
+	settlePoll    = envDuration("SETTLE_POLL_MS", 250*time.Millisecond)
+	settleMax     = envDuration("SETTLE_MAX_MS", 6000*time.Millisecond)
+)
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms >= 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return def
+}
 
 // RunExecutor is the state machine that drives the CREATE_TASK -> ADVANCE
 // protocol described by the server. It reacts to each distinct Task state
@@ -32,7 +68,7 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 		}
 
 		if len(cur.ExecutionList) > 0 {
-			executeList(cur.ExecutionList)
+			executeList(cur.ExecutionList, overlay, overlayStateFor(cur))
 			sendAdvance(state, deviceID, false, fsStore)
 			continue
 		}
@@ -44,7 +80,12 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 }
 
 func sendAdvance(state *State, deviceID string, includeFS bool, fsStore *SnapshotStore) {
-	shot, err := CaptureScreen()
+	// Don't capture or advance while the human is driving the mouse.
+	takeover.Gate()
+
+	// Wait for the screen to settle before capturing, so the next step is
+	// planned against a fully-rendered screen rather than a mid-load one.
+	shot, err := CaptureStableScreen(settleInitial, settlePoll, settleMax)
 	if err != nil {
 		log.Printf("executor: screenshot failed: %v", err)
 		return
@@ -56,7 +97,18 @@ func sendAdvance(state *State, deviceID string, includeFS bool, fsStore *Snapsho
 		ScreenshotPayload: shot,
 	}
 	if includeFS {
-		action.FileSystemPayload = fsStore.Snapshot()
+		snap := fsStore.Snapshot()
+		action.FileSystemPayload = snap
+		// Log the newest few entries so you can confirm, from the worker
+		// log, that recently-created files (a just-taken screenshot, a fresh
+		// download) are actually in the snapshot. If the file you asked
+		// about isn't near the top here, it's a capture problem; if it IS
+		// here but the AI still picks the wrong one, it's a model/prompt
+		// problem — this line tells you which.
+		log.Printf("executor: filesystem snapshot: %d entries (newest first)", len(snap))
+		for i := 0; i < len(snap) && i < 8; i++ {
+			log.Printf("executor:   [%d] mtime=%d %s", i, snap[i].ModTime, snap[i].Path)
+		}
 	}
 
 	SendAction(state, action)
@@ -66,11 +118,26 @@ func sendAdvance(state *State, deviceID string, includeFS bool, fsStore *Snapsho
 // Hold-state is local to a single list: per the planner's system prompt, a
 // drag's press/move/release steps all arrive together in one ExecutionList,
 // so there's no need to persist hold-state across network round trips.
-func executeList(execs []Execution) {
+//
+// Before each physical action it pushes an overlay update carrying a live
+// ActionText ("Typing ...", "Click (x,y)", ...) built on top of `base`
+// (the step-level state for this instruction), so the panel shows the
+// most granular thing possible: what the machine is doing at this instant.
+func executeList(execs []Execution, overlay chan<- OverlayState, base OverlayState) {
 	leftHeld := false
 	rightHeld := false
 
 	for _, e := range execs {
+		// If the human has taken over the mouse, block here until it's clear
+		// to proceed — so the worker never fights the person for the cursor.
+		takeover.Gate()
+
+		if txt := actionText(e); txt != "" {
+			st := base
+			st.ActionText = txt
+			pushOverlay(overlay, st)
+		}
+
 		switch e.Type {
 		case "MOUSE_MOVEMENT":
 			MoveMouse(e.MousePosX, e.MousePosY)
@@ -105,6 +172,9 @@ func executeList(execs []Execution) {
 		default:
 			log.Printf("executor: unknown execution type %q", e.Type)
 		}
+
+		// Let the UI settle before the next action in this list.
+		time.Sleep(interActionDelay)
 	}
 
 	// Safety net: never leave a button physically stuck down if a list
@@ -114,6 +184,47 @@ func executeList(execs []Execution) {
 	}
 	if rightHeld {
 		RightUp()
+	}
+}
+
+// actionText renders one physical action as a short human-readable line for
+// the overlay. Returns "" for actions with nothing worth announcing.
+func actionText(e Execution) string {
+	switch e.Type {
+	case "MOUSE_MOVEMENT":
+		return fmt.Sprintf("Move cursor → (%d, %d)", e.MousePosX, e.MousePosY)
+	case "LEFT_CLICK":
+		switch {
+		case e.MouseHold:
+			return "Left button down"
+		default:
+			return "Left click"
+		}
+	case "RIGHT_CLICK":
+		switch {
+		case e.MouseHold:
+			return "Right button down"
+		default:
+			return "Right click"
+		}
+	case "KEYBOARD_INPUT":
+		s := e.KeyString
+		if len(s) > 24 {
+			s = s[:24] + "…"
+		}
+		return fmt.Sprintf("Typing “%s”", s)
+	default:
+		return ""
+	}
+}
+
+// pushOverlay sends without ever blocking the executor: if the overlay
+// channel is momentarily full, the intermediate action update is dropped
+// (the next one, or the step-level update, will catch the panel up).
+func pushOverlay(overlay chan<- OverlayState, st OverlayState) {
+	select {
+	case overlay <- st:
+	default:
 	}
 }
 
@@ -141,21 +252,23 @@ func overlayStateFor(t Task) OverlayState {
 		}
 
 		return OverlayState{
-			Visible:   true,
-			Status:    t.Status,
-			StepText:  stepText,
-			StepIndex: stepIndex,
-			StepTotal: total,
+			Visible:         true,
+			Status:          t.Status,
+			TaskDescription: t.Description,
+			StepText:        stepText,
+			StepIndex:       stepIndex,
+			StepTotal:       total,
 		}
 
 	case "COMPLETED":
 		total := len(t.InstructionList)
 		return OverlayState{
-			Visible:   true,
-			Status:    "COMPLETED",
-			StepText:  "Task completed",
-			StepIndex: total,
-			StepTotal: total,
+			Visible:         true,
+			Status:          "COMPLETED",
+			TaskDescription: t.Description,
+			StepText:        "Task completed",
+			StepIndex:       total,
+			StepTotal:       total,
 		}
 
 	default: // CANCELLED, NONE

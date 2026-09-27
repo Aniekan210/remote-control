@@ -104,6 +104,15 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The default coder/websocket read limit is 32 KiB, but an ADVANCE
+	// carries a full-screen PNG screenshot (base64-inflated inside JSON),
+	// which is routinely hundreds of KiB to a few MiB. Without raising
+	// this, the server closes the connection with StatusMessageTooBig the
+	// instant the worker sends its first real ADVANCE — which looked like
+	// a mysterious reconnect loop on the worker side. 256 MiB is a safety
+	// ceiling, not an allocation.
+	conn.SetReadLimit(256 << 20)
+
 	rooms[taskID][conn] = true
 	clientCount := len(rooms[taskID])
 
@@ -244,6 +253,16 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				task.CurrentInstructionIndex = 0
 				task.Context = false // next ADVANCE generates executions, not a new plan
 				srvLogf("device=%s: plan set, %d instructions: %v", taskID, len(instructions), instructions)
+
+				// An empty plan means there's nothing to execute. Mark the
+				// task COMPLETED instead of leaving it RUNNING with 0
+				// instructions — otherwise the next ADVANCE asks for
+				// instruction 0 of a 0-length list and fails ("index out of
+				// range") on a loop until the retries give up.
+				if len(instructions) == 0 {
+					task.Status = "COMPLETED"
+					srvLogf("device=%s: planner returned an empty plan, marking COMPLETED", taskID)
+				}
 
 			default:
 				// Execution call: result is the execution list for the
@@ -399,7 +418,7 @@ func main() {
 	http.HandleFunc("/ws", handleWebSocketConnections)
 
 	fmt.Println(
-		"Server running. API: POST http://localhost:8080/rooms | WS: ws://localhost:8080/ws?id=<id>",
+		"Server running",
 	)
 	srvLogf("listening on :8080")
 

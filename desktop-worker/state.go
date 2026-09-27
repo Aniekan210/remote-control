@@ -32,6 +32,15 @@ func (s *State) GetConn() *websocket.Conn {
 	return s.conn
 }
 
+// CurrentStatus returns the status of the most recently seen task
+// ("RUNNING", "PAUSED", "NONE", ...). Used by the takeover monitor so it
+// only pauses when a task is actually running.
+func (s *State) CurrentStatus() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastTask.Status
+}
+
 // UpdateTask stores the freshly received task and reports whether it
 // actually differs from what we last saw. Duplicate/no-op broadcasts
 // (which the server can legitimately send) are filtered out here so
@@ -63,10 +72,20 @@ type OverlayState struct {
 	// Status is "RUNNING", "PAUSED", or "COMPLETED" — drives the status
 	// dot color and the small label text.
 	Status string
+	// TaskDescription is the overall goal the user typed ("open chrome and
+	// search for cats") — shown small/muted for context above the current
+	// step.
+	TaskDescription string
 	// StepText is the current instruction being worked on, or a
 	// placeholder like "Planning..." before the instruction list exists
 	// yet (right after CREATE_TASK, before the planning call returns).
 	StepText string
+	// ActionText is the live low-level action being performed right now
+	// within the current step — e.g. `Typing "chrome"`, `Click (452, 310)`,
+	// `Move cursor`. Empty when nothing physical is executing (planning,
+	// paused, between steps). This is the most granular line: it's what
+	// the machine is literally doing at this instant.
+	ActionText string
 	// StepIndex is the 1-based current step number for display ("Step 3
 	// of 7"). 0 means no step data yet (still planning).
 	StepIndex int

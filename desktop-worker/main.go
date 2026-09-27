@@ -90,7 +90,7 @@ func main() {
 
 	serverAddr := os.Getenv("REMOTE_SERVER_ADDR")
 	if serverAddr == "" {
-		serverAddr = "localhost:8080"
+		serverAddr = "api.control.aniekan.dev"
 	}
 
 	deviceID, isNew, err := GetOrCreateDeviceID()
@@ -122,7 +122,7 @@ func main() {
 		log.Println("reusing cached device ID from a previous launch — skipping pairing page")
 	}
 
-	wsURL := (&url.URL{Scheme: "ws", Host: serverAddr, Path: "/ws", RawQuery: "id=" + deviceID}).String()
+	wsURL := (&url.URL{Scheme: "wss", Host: serverAddr, Path: "/ws", RawQuery: "id=" + deviceID}).String()
 	fmt.Println(" Connecting to:", wsURL)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -150,6 +150,22 @@ func main() {
 		go RunOverlay(overlayUpdates, overlayDone)
 	} else {
 		log.Println("overlay disabled via REMOTE_WORKER_NO_OVERLAY=1")
+	}
+
+	// Human-takeover pause: moving the physical mouse pauses automation (see
+	// takeover.go). Uses a low-level mouse hook; if it misbehaves on a given
+	// machine, REMOTE_WORKER_NO_TAKEOVER=1 disables it and the worker runs
+	// without the pause feature.
+	if os.Getenv("REMOTE_WORKER_NO_TAKEOVER") != "1" {
+		takeover = NewTakeover(
+			func() { SendAction(state, Action{Type: "PAUSE_TASK", DeviceID: deviceID}) },
+			func() { SendAction(state, Action{Type: "RESUME_TASK", DeviceID: deviceID}) },
+			func() bool { return state.CurrentStatus() == "RUNNING" },
+			overlayUpdates,
+		)
+		go RunTakeover(takeover, ctx.Done())
+	} else {
+		log.Println("human-takeover pause disabled via REMOTE_WORKER_NO_TAKEOVER=1")
 	}
 
 	sigCh := make(chan os.Signal, 1)
