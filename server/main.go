@@ -213,6 +213,11 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				srvLogf("device=%s: sendMessage attempt %d/%d FAILED after %s: %v",
 					taskID, attempt, maxRetries, callElapsed, sendErr)
 				if attempt < maxRetries {
+					// The rate-limit gate inside sendMessage already spaces
+					// each attempt by AI_MIN_REQUEST_INTERVAL_MS (default
+					// 1500ms). This backoff is *additional* spacing, so the
+					// total delay between retries is gate + backoff. Kept
+					// modest so a genuinely transient 429 clears quickly.
 					backoff := time.Duration(attempt) * time.Second
 					srvLogf("device=%s: retrying in %s", taskID, backoff)
 					time.Sleep(backoff) // 1s, 2s backoff
