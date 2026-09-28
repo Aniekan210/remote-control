@@ -74,8 +74,24 @@ FILES
   'Screenshot 1.png' from the Pictures\Screenshots folder." Prefer opening
   it from its folder in File Explorer.
 
+DECISION
+- "continue": "instructions" is the plan.
+- "ask": you can't decide safely (the task or the user's answer is
+  ambiguous, or only the user can choose). Put one short question for the
+  user in "message"; leave "instructions" empty.
+- "stop": nothing more should be done (e.g. the user said to skip the rest).
+  Put a short note in "message"; leave "instructions" empty.
+
+REVISING
+If the message starts with REVISE, a plan is already under way: you get the
+completed steps, the remaining steps, why it's being revised, and the user's
+answers. Plan from the current screenshot and follow the answers. Return
+ONLY the steps still to do — never repeat completed ones. You may change,
+drop or add steps (fix-ups, or e.g. "Send the invite without a note.").
+
 OUTPUT
-Only JSON, no prose, no code fences: {"instructions": ["...", "..."]}
+Only JSON, no prose, no code fences:
+{"decision": "continue", "message": "", "instructions": [{"text": "...", "needs_confirmation": false}]}
 `
 
 // executorSystemPrompt turns ONE instruction plus the screenshot into

@@ -149,6 +149,8 @@ export function Transcript({ t, now, live }: { t: Timeline; now: number; live: b
               <span className="text-hold">Paused. Nothing will happen until you resume.</span>
             ) : planning ? (
               <span className="shimmer">Reading your request…</span>
+            ) : t.revising ? (
+              <span className="shimmer">Revising the plan…</span>
             ) : (
               <span className="shimmer">
                 Step {active + 1} of {t.steps.length} in progress
@@ -358,6 +360,20 @@ function ActionItem({ e, latest }: { e: Execution; latest: boolean }) {
 
 function MarkRow({ m }: { m: Mark }) {
   if (m.kind === "question" || m.kind === "answer") return <QuestionMarkRow m={m} />;
+  if (m.kind === "replan") {
+    return (
+      <Row
+        icon={<IconDot width={12} height={12} className="text-signal" />}
+        last={false}
+        header={
+          <span className="flex items-start justify-between gap-3 text-[13px]">
+            <span className="leading-snug text-dim">Plan updated{m.text ? `: ${m.text}` : ""}</span>
+            <Meta>{fmtClock(m.at)}</Meta>
+          </span>
+        }
+      />
+    );
+  }
   const Icon = m.kind === "paused" ? IconPause : IconPlay;
   return (
     <Row

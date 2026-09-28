@@ -117,17 +117,48 @@ func sendMessage(task Task, action Action, key apiKey) (any, float64, error) {
 	return callExecutor(callID, task, action, key)
 }
 
-// planSchema is the strict structured-output schema for the planner.
+// planSchema is the strict structured-output schema for the planner, for
+// both a first plan and a revise.
 var planSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
+		"decision": map[string]any{
+			"type": "string",
+			"enum": []string{"continue", "ask", "stop"},
+		},
+		"message": map[string]any{"type": "string"},
 		"instructions": map[string]any{
-			"type":  "array",
-			"items": map[string]any{"type": "string"},
+			"type": "array",
+			"items": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"text":               map[string]any{"type": "string"},
+					"needs_confirmation": map[string]any{"type": "boolean"},
+				},
+				"required":             []string{"text", "needs_confirmation"},
+				"additionalProperties": false,
+			},
 		},
 	},
-	"required":             []string{"instructions"},
+	"required":             []string{"decision", "message", "instructions"},
 	"additionalProperties": false,
+}
+
+// Planner decisions (see the planner prompt).
+const (
+	decisionContinue = "continue" // Instructions are the (remaining) plan
+	decisionAsk      = "ask"      // Message is a question for the user
+	decisionStop     = "stop"     // nothing more to do
+)
+
+// PlanResult is the planner's answer. On a revise, Instructions are only
+// the REMAINING steps; NeedsConfirm is parallel to them.
+type PlanResult struct {
+	Revise       bool // this was a revise call (set by the caller, not the model)
+	Decision     string
+	Message      string
+	Instructions []string
+	NeedsConfirm []bool
 }
 
 // executionActionSchema is one physical action: exactly the five
@@ -184,25 +215,36 @@ type ExecResult struct {
 	Actions         []Execution
 }
 
-// callPlanner asks the planner to break the task into instructions.
+// isRevise reports whether the next planner call revises a plan already
+// under way (a replan or the user's answer) rather than making the first.
+func isRevise(t Task) bool {
+	return t.Reason != "" || len(t.InstructionList) > 0
+}
+
+// callPlanner asks the planner for a plan: the first one, or — when the
+// task already has a plan or a revise reason — a revision of the rest.
 func callPlanner(callID string, task Task, action Action, key apiKey) (any, float64, error) {
-	fs := formatFileList(action.FileSystemPayload, time.Now())
+	revise := isRevise(task)
 
 	// The task description lives on the Task (set at CREATE_TASK), NOT on
 	// this ADVANCE action — an ADVANCE carries no Description, so reading
 	// action.Description here sends the planner an empty task and the
 	// model correctly reports "No task was provided."
-	aiLogf("[%s] planning request: task=%q filesystemEntries=%d",
-		callID, task.Description, len(action.FileSystemPayload))
+	var text string
+	if revise {
+		text = reviseUserText(task, action.FileSystemPayload, time.Now())
+		aiLogf("[%s] revise request: task=%q reason=%q completed=%d remaining=%d answers=%d",
+			callID, task.Description, task.Reason, min(task.CurrentInstructionIndex, len(task.InstructionList)),
+			max(len(task.InstructionList)-task.CurrentInstructionIndex, 0), len(task.Answers))
+	} else {
+		text = fmt.Sprintf("Task:\n%s\n\nFilesystem (filtered, newest first):\n%s",
+			task.Description, formatFileList(action.FileSystemPayload, time.Now()))
+		aiLogf("[%s] planning request: task=%q filesystemEntries=%d",
+			callID, task.Description, len(action.FileSystemPayload))
+	}
 
 	userContent := []any{
-		map[string]any{
-			"type": "text",
-			"text": fmt.Sprintf(
-				"Task:\n%s\n\nFilesystem (filtered, newest first):\n%s",
-				task.Description, fs,
-			),
-		},
+		map[string]any{"type": "text", "text": text},
 		screenshotContent(action.ScreenshotPayload),
 	}
 
@@ -212,14 +254,71 @@ func callPlanner(callID string, task Task, action Action, key apiKey) (any, floa
 		return nil, cost, err
 	}
 
-	instructions, err := parseInstructionList(response)
+	plan, err := parsePlan(response)
 	if err != nil {
-		aiLogf("[%s] FAILED invalid instruction list: %v, cleaned response: %s", callID, err, response)
-		return nil, cost, fmt.Errorf("invalid instruction list: %w (raw: %s)", err, response)
+		aiLogf("[%s] FAILED invalid plan: %v, cleaned response: %s", callID, err, response)
+		return nil, cost, fmt.Errorf("invalid plan: %w (raw: %s)", err, response)
 	}
+	plan.Revise = revise
 
-	aiLogf("[%s] SUCCESS planning: %d instructions: %v", callID, len(instructions), instructions)
-	return instructions, cost, nil
+	aiLogf("[%s] SUCCESS planning (revise=%v): decision=%s message=%q %d instructions: %v",
+		callID, revise, plan.Decision, plan.Message, len(plan.Instructions), plan.Instructions)
+	return plan, cost, nil
+}
+
+// reviseUserText is a revise call's message (B7): kept small on purpose —
+// the task, the completed steps and remaining steps as short strings, why
+// it's being revised, and the user's answers. The filesystem list is only
+// included when the reason or an answer is about files or folders.
+func reviseUserText(task Task, files []FileEntry, now time.Time) string {
+	idx := min(max(task.CurrentInstructionIndex, 0), len(task.InstructionList))
+	var b strings.Builder
+	b.WriteString("REVISE the plan.\n\n")
+	fmt.Fprintf(&b, "Task:\n%s\n\n", task.Description)
+	fmt.Fprintf(&b, "Why it's being revised: %s\n\n", task.Reason)
+	b.WriteString("Completed steps:\n")
+	if idx == 0 {
+		b.WriteString("(none)\n")
+	}
+	for i := 0; i < idx; i++ {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, task.InstructionList[i])
+	}
+	b.WriteString("\nRemaining steps (as planned):\n")
+	if idx >= len(task.InstructionList) {
+		b.WriteString("(none)\n")
+	}
+	for i := idx; i < len(task.InstructionList); i++ {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, task.InstructionList[i])
+	}
+	if len(task.Answers) > 0 {
+		b.WriteString("\nUser's answers so far:\n")
+		for _, a := range task.Answers {
+			fmt.Fprintf(&b, "- %s\n", a)
+		}
+	}
+	if mentionsFiles(task.Reason + " " + strings.Join(task.Answers, " ")) {
+		fmt.Fprintf(&b, "\nFilesystem (filtered, newest first):\n%s\n", formatFileList(files, now))
+	}
+	b.WriteString("\nReturn only the steps still to do, starting from the current screen.")
+	return b.String()
+}
+
+// mentionsFiles is a cheap check for whether a replan reason or an answer
+// is about files or folders — only then is the filesystem list (the
+// biggest part of a planning prompt) worth sending on a revise.
+func mentionsFiles(text string) bool {
+	t := strings.ToLower(text)
+	for _, w := range []string{
+		"file", "folder", "directory", "document", "download", "desktop",
+		"pictures", "photo", "screenshot", "attachment", "attach", "upload",
+		"save", "saved", "path", "drive", "explorer", "~\\", ":\\",
+		".pdf", ".doc", ".xls", ".ppt", ".txt", ".csv", ".png", ".jpg", ".jpeg", ".zip", ".mp3", ".mp4",
+	} {
+		if strings.Contains(t, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // callExecutor asks the executor for the physical actions that carry out
@@ -623,17 +722,83 @@ func postChatCompletion(callID, mode, model string, requestBody map[string]any, 
 	return response, cost, resp.StatusCode, nil
 }
 
-// parseInstructionList extracts the planner's list of instructions from
-// the model's JSON, tolerant of the two shapes it realistically returns:
+// parsePlan extracts the planner's answer from the model's JSON. Besides
+// the schema shape ({"decision", "message", "instructions": [{"text",
+// "needs_confirmation"}]}) it still accepts the older, simpler shapes —
+// a bare array of strings, or an object wrapping one — as "continue" with
+// no step flagged, since models aren't perfectly consistent about which
+// shape they emit (and json_object fallback models may ignore the schema).
+func parsePlan(response string) (PlanResult, error) {
+	var obj struct {
+		Decision     string          `json:"decision"`
+		Message      string          `json:"message"`
+		Instructions json.RawMessage `json:"instructions"`
+	}
+	if err := json.Unmarshal([]byte(response), &obj); err == nil && len(obj.Instructions) > 0 {
+		var steps []struct {
+			Text              string `json:"text"`
+			NeedsConfirmation bool   `json:"needs_confirmation"`
+		}
+		if err := json.Unmarshal(obj.Instructions, &steps); err == nil {
+			plan := PlanResult{
+				Decision: strings.ToLower(strings.TrimSpace(obj.Decision)),
+				Message:  strings.TrimSpace(obj.Message),
+			}
+			for _, st := range steps {
+				if t := strings.TrimSpace(st.Text); t != "" {
+					plan.Instructions = append(plan.Instructions, t)
+					plan.NeedsConfirm = append(plan.NeedsConfirm, st.NeedsConfirmation)
+				}
+			}
+			return validatePlan(plan)
+		}
+	}
+	if err := json.Unmarshal([]byte(response), &obj); err == nil && obj.Decision != "" && len(obj.Instructions) == 0 {
+		// {"decision": "ask", "message": "..."} with instructions omitted.
+		return validatePlan(PlanResult{
+			Decision: strings.ToLower(strings.TrimSpace(obj.Decision)),
+			Message:  strings.TrimSpace(obj.Message),
+		})
+	}
+
+	instructions, err := parseInstructionList(response)
+	if err != nil {
+		return PlanResult{}, err
+	}
+	plan := PlanResult{Decision: decisionContinue, Instructions: instructions}
+	plan.NeedsConfirm = make([]bool, len(instructions))
+	if d := strings.ToLower(strings.TrimSpace(obj.Decision)); d != "" {
+		plan.Decision = d
+		plan.Message = strings.TrimSpace(obj.Message)
+	}
+	return validatePlan(plan)
+}
+
+// validatePlan normalizes a decision and rejects nonsense.
+func validatePlan(p PlanResult) (PlanResult, error) {
+	switch p.Decision {
+	case "":
+		p.Decision = decisionContinue
+	case decisionContinue, decisionStop:
+	case decisionAsk:
+		if p.Message == "" {
+			return PlanResult{}, fmt.Errorf("decision ask with no question in message")
+		}
+	default:
+		return PlanResult{}, fmt.Errorf("unknown decision %q", p.Decision)
+	}
+	if len(p.NeedsConfirm) != len(p.Instructions) {
+		p.NeedsConfirm = make([]bool, len(p.Instructions))
+	}
+	return p, nil
+}
+
+// parseInstructionList extracts a plain list of instruction strings,
+// tolerant of the two older shapes the model realistically returns:
 //
 //  1. a bare array — ["Open Chrome.", "Search."]
-//  2. an object wrapping the array — {"instructions": [...]} (which is what
-//     response_format:json_object nudges the model toward), or the same
+//  2. an object wrapping the array — {"instructions": [...]}, or the same
 //     under a differently-named key.
-//
-// Being tolerant here matters because the model is not perfectly
-// consistent about which shape it emits; keying the whole pipeline on one
-// exact shape is what made planning fail intermittently before.
 func parseInstructionList(response string) ([]string, error) {
 	// 1) Bare array.
 	var arr []string

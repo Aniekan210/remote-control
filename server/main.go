@@ -408,30 +408,15 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 					taskID, task.Status)
 
 			case task.Context:
-				// Planning call: result is the instruction list.
-				instructions, ok := result.([]string)
+				// Planning call: a first plan, or a revision of the rest.
+				plan, ok := result.(PlanResult)
 				if !ok {
-					srvLogf("device=%s: expected []string from planning call, got %T (value: %+v) — resetting task",
+					srvLogf("device=%s: expected PlanResult from planning call, got %T (value: %+v) — resetting task",
 						taskID, result, result)
 					task = resetTask(task.DeviceID)
 					break
 				}
-				task.InstructionList = instructions
-				task.CurrentInstructionIndex = 0
-				task.Context = false // next ADVANCE generates executions, not a new plan
-				task.Reason = ""
-				task.InstrAttempts = 0
-				srvLogf("device=%s: plan set, %d instructions: %v", taskID, len(instructions), instructions)
-
-				// An empty plan means there's nothing to execute. Mark the
-				// task COMPLETED instead of leaving it RUNNING with 0
-				// instructions — otherwise the next ADVANCE asks for
-				// instruction 0 of a 0-length list and fails ("index out of
-				// range") on a loop until the retries give up.
-				if len(instructions) == 0 {
-					task.Status = "COMPLETED"
-					srvLogf("device=%s: planner returned an empty plan, marking COMPLETED", taskID)
-				}
+				task = applyPlan(task, plan, screenshotDataURL(action.ScreenshotPayload))
 
 			default:
 				// Execution call: result is the executor's verdict on the
@@ -488,6 +473,63 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 		// Network I/O happens AFTER releasing the mutex.
 		broadcastToTaskRoom(r.Context(), taskID, task, clients)
 	}
+}
+
+// applyPlan applies the planner's answer.
+//   - continue: a first plan replaces the (empty) list; a revise keeps the
+//     completed steps (list[:idx]) and replaces everything after with the
+//     new remaining steps. Either way execution carries on at idx.
+//   - ask:      the planner can't decide safely — ask the user (the answer
+//     comes back through a revise)
+//   - stop:     nothing more to do — COMPLETED
+func applyPlan(t Task, p PlanResult, image string) Task {
+	switch p.Decision {
+	case decisionAsk:
+		srvLogf("device=%s: planner asks the user: %s", t.DeviceID, p.Message)
+		t.Context = false
+		t.Reason = ""
+		return askUser(t, "blocked", p.Message, image)
+
+	case decisionStop:
+		srvLogf("device=%s: planner says stop: %s — task COMPLETED", t.DeviceID, p.Message)
+		t.Context = false
+		t.Reason = ""
+		t.ExecutionList = make([]Execution, 0)
+		t.Status = "COMPLETED"
+		return t
+	}
+
+	idx := 0
+	if p.Revise {
+		idx = min(max(t.CurrentInstructionIndex, 0), len(t.InstructionList))
+	}
+	completed := append([]string{}, t.InstructionList[:idx]...)
+	completedConfirm := make([]bool, idx)
+	copy(completedConfirm, t.NeedsConfirm[:min(idx, len(t.NeedsConfirm))])
+
+	t.InstructionList = append(completed, p.Instructions...)
+	t.NeedsConfirm = append(completedConfirm, p.NeedsConfirm...)
+	t.CurrentInstructionIndex = idx
+	t.Context = false // next ADVANCE generates executions, not a new plan
+	t.Reason = ""
+	t.InstrAttempts = 0
+	t.ExecutionList = make([]Execution, 0)
+	if t.ConfirmedIndex >= idx {
+		// The steps from idx on are new; an approval was for the old ones.
+		t.ConfirmedIndex = -1
+	}
+	srvLogf("device=%s: plan set (revise=%v), %d completed + %d new instructions: %v",
+		t.DeviceID, p.Revise, idx, len(p.Instructions), p.Instructions)
+
+	// An empty first plan means there's nothing to execute. Mark the task
+	// COMPLETED instead of leaving it RUNNING with 0 instructions —
+	// otherwise the next ADVANCE asks for instruction 0 of a 0-length list
+	// and fails ("index out of range") on a loop until the retries give up.
+	if len(t.InstructionList) == 0 {
+		t.Status = "COMPLETED"
+		srvLogf("device=%s: planner returned an empty plan, marking COMPLETED", t.DeviceID)
+	}
+	return t
 }
 
 // maxExecutorCallsPerStep caps executor calls on one instruction (an "act"
