@@ -95,8 +95,9 @@ func modelForContext(planning bool) string {
 
 // sendMessage makes one AI call for the task's current phase and returns
 // the parsed result plus what OpenRouter says the call cost in USD (0 when
-// the call never got a usable response).
-func sendMessage(task Task, action Action) (any, float64, error) {
+// the call never got a usable response). key is the OpenRouter key the call
+// is billed to (the user's own, or the server's for an owner).
+func sendMessage(task Task, action Action, key apiKey) (any, float64, error) {
 	// callID ties every log line for this one call together, so concurrent
 	// tasks' logs don't get interleaved into something unreadable — grep
 	// for the same callID to follow one call start-to-finish.
@@ -111,9 +112,9 @@ func sendMessage(task Task, action Action) (any, float64, error) {
 		task.CurrentInstructionIndex, len(task.InstructionList))
 
 	if task.Context {
-		return callPlanner(callID, task, action)
+		return callPlanner(callID, task, action, key)
 	}
-	return callExecutor(callID, task, action)
+	return callExecutor(callID, task, action, key)
 }
 
 // planSchema is the strict structured-output schema for the planner.
@@ -158,7 +159,7 @@ var executionSchema = map[string]any{
 }
 
 // callPlanner asks the planner to break the task into instructions.
-func callPlanner(callID string, task Task, action Action) (any, float64, error) {
+func callPlanner(callID string, task Task, action Action, key apiKey) (any, float64, error) {
 	fs := formatFileList(action.FileSystemPayload, time.Now())
 
 	// The task description lives on the Task (set at CREATE_TASK), NOT on
@@ -180,7 +181,7 @@ func callPlanner(callID string, task Task, action Action) (any, float64, error) 
 	}
 
 	response, cost, err := callOpenRouter(callID, "PLANNING", modelForContext(true),
-		plannerSystemPrompt, userContent, "plan", planSchema, plannerOptions())
+		plannerSystemPrompt, userContent, "plan", planSchema, plannerOptions(), key)
 	if err != nil {
 		return nil, cost, err
 	}
@@ -197,7 +198,7 @@ func callPlanner(callID string, task Task, action Action) (any, float64, error) 
 
 // callExecutor asks the executor for the physical actions that carry out
 // the current instruction.
-func callExecutor(callID string, task Task, action Action) (any, float64, error) {
+func callExecutor(callID string, task Task, action Action, key apiKey) (any, float64, error) {
 	// Guard against an out-of-range index instead of panicking.
 	if task.CurrentInstructionIndex < 0 ||
 		task.CurrentInstructionIndex >= len(task.InstructionList) {
@@ -240,7 +241,7 @@ func callExecutor(callID string, task Task, action Action) (any, float64, error)
 	// No output cap for the executor: it's cheap, and a long, careful action
 	// list is worth more than the tokens it saves to cut it short.
 	response, cost, err := callOpenRouter(callID, "EXECUTION", modelForContext(false),
-		executorSystemPrompt, userContent, "actions", executionSchema, callOptions{})
+		executorSystemPrompt, userContent, "actions", executionSchema, callOptions{}, key)
 	if err != nil {
 		return nil, cost, err
 	}
@@ -312,7 +313,7 @@ var schemaUnsupported = struct {
 // that (HTTP 400 mentioning the response format), the call is retried once
 // with plain json_object, and the model is remembered so it isn't tried
 // again. The tolerant parsers downstream stay in place either way.
-func callOpenRouter(callID, mode, model, systemPrompt string, userContent []any, schemaName string, schema map[string]any, opts callOptions) (string, float64, error) {
+func callOpenRouter(callID, mode, model, systemPrompt string, userContent []any, schemaName string, schema map[string]any, opts callOptions, key apiKey) (string, float64, error) {
 	var system any = systemPrompt
 	if strings.HasPrefix(model, "anthropic/") {
 		system = []any{map[string]any{
@@ -366,7 +367,7 @@ func callOpenRouter(callID, mode, model, systemPrompt string, userContent []any,
 			requestBody["reasoning"] = map[string]any{"effort": opts.reasoningEffort}
 		}
 
-		content, cost, status, err := postChatCompletion(callID, mode, model, requestBody)
+		content, cost, status, err := postChatCompletion(callID, mode, model, requestBody, key)
 		if err != nil && useSchema && status == http.StatusBadRequest && mentionsResponseFormat(err.Error()) {
 			aiLogf("[%s] model=%s rejected json_schema output, falling back to json_object for this model from now on", callID, model)
 			schemaUnsupported.Lock()
@@ -389,22 +390,29 @@ func mentionsResponseFormat(msg string) bool {
 
 // postChatCompletion performs the HTTP call. status is the HTTP status (0
 // when no response arrived).
-func postChatCompletion(callID, mode, model string, requestBody map[string]any) (string, float64, int, error) {
+func postChatCompletion(callID, mode, model string, requestBody map[string]any, key apiKey) (string, float64, int, error) {
 	body, err := json.Marshal(requestBody)
 	if err != nil {
 		aiLogf("[%s] FAILED marshal request body: %v", callID, err)
 		return "", 0, 0, fmt.Errorf("marshal request body: %w", err)
 	}
 
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
+	if key.value == "" {
 		// This is a very common silent-failure cause: every request will
 		// come back 401 and, without this line, that 401 looks identical
 		// to a real auth/billing problem with a *valid* key.
-		aiLogf("[%s] WARNING: OPENROUTER_API_KEY is empty — every request will fail auth", callID)
+		if key.serverKey {
+			aiLogf("[%s] WARNING: OPENROUTER_API_KEY is empty — every request will fail auth", callID)
+		} else {
+			aiLogf("[%s] WARNING: the user's OpenRouter key is empty — every request will fail auth", callID)
+		}
 	}
 
-	aiLogf("[%s] calling OpenRouter: model=%s requestBytes=%d", callID, model, len(body))
+	keyOwner := "user"
+	if key.serverKey {
+		keyOwner = "server"
+	}
+	aiLogf("[%s] calling OpenRouter: model=%s key=%s requestBytes=%d", callID, model, keyOwner, len(body))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -420,7 +428,7 @@ func postChatCompletion(callID, mode, model string, requestBody map[string]any) 
 		return "", 0, 0, fmt.Errorf("build request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Authorization", "Bearer "+key.value)
 	req.Header.Set("Content-Type", "application/json")
 
 	start := time.Now()
@@ -486,9 +494,9 @@ func postChatCompletion(callID, mode, model string, requestBody map[string]any) 
 	}
 
 	cost := result.Usage.Cost
-	day, month := costs.add(cost)
-	aiLogf("[%s] usage: mode=%s model=%s promptTokens=%d cachedTokens=%d completionTokens=%d reasoningTokens=%d totalTokens=%d cost=$%.5f | today=$%.4f month=$%.4f",
-		callID, mode, model, result.Usage.PromptTokens, result.Usage.PromptTokensDetails.CachedTokens,
+	day, month := costs.add(cost, key.serverKey)
+	aiLogf("[%s] usage: mode=%s model=%s key=%s promptTokens=%d cachedTokens=%d completionTokens=%d reasoningTokens=%d totalTokens=%d cost=$%.5f | today=$%.4f month=$%.4f",
+		callID, mode, model, keyOwner, result.Usage.PromptTokens, result.Usage.PromptTokensDetails.CachedTokens,
 		result.Usage.CompletionTokens, result.Usage.CompletionTokensDetails.ReasoningTokens,
 		result.Usage.TotalTokens, cost, day, month)
 

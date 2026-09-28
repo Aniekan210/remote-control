@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -196,6 +197,16 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// Resolve which OpenRouter key a new task is billed to before
+		// taking the lock: it's a database round trip.
+		var newKey apiKey
+		var newKeyErr error
+		if action.Type == "CREATE_TASK" {
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			newKey, newKeyErr = resolveAPIKey(ctx, taskID)
+			cancel()
+		}
+
 		mutex.Lock()
 
 		task := taskHashTable[taskID]
@@ -209,15 +220,30 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 
 		switch action.Type {
 		case "CREATE_TASK":
+			// Every task needs a key to bill: the user's own, or the
+			// server's for an owner (OWNER_USER_IDS). Without one the task
+			// is refused and the client is told what to do.
+			if newKeyErr != nil {
+				if errors.Is(newKeyErr, errNoKey) {
+					task.LastError = errNoKey.Error()
+				} else {
+					task.LastError = "Couldn't look up your OpenRouter key. Try again."
+				}
+				srvLogf("device=%s: CREATE_TASK refused, no usable OpenRouter key: %v", taskID, newKeyErr)
+				break
+			}
+
 			// The monthly budget protects the server's own OpenRouter key:
-			// once it's spent, new tasks are refused (the running one, if
-			// any, is left alone) and the client is told why.
-			if spent := costs.monthTotal(); spent >= limits.MonthlyBudgetUSD {
+			// once it's spent, new tasks on it are refused (the running
+			// one, if any, is left alone) and the client is told why.
+			// Users' own keys are theirs to limit.
+			if spent := costs.serverMonthTotal(); newKey.serverKey && spent >= limits.MonthlyBudgetUSD {
 				task.LastError = "Monthly AI budget reached"
 				srvLogf("device=%s: CREATE_TASK refused, monthly budget reached ($%.4f of $%.2f)",
 					taskID, spent, limits.MonthlyBudgetUSD)
 				break
 			}
+			taskKeys[taskID] = newKey
 
 			// Full reset, not just overwrite: a device that ran a previous
 			// task (completed, paused, or otherwise not explicitly
@@ -287,10 +313,20 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
+			key, haveKey := taskKeys[taskID]
+
 			// Release the lock before the network call so a slow request
 			// (or our retries) don't block every other room's messages
 			// from being processed while we wait on the AI.
 			mutex.Unlock()
+
+			if !haveKey {
+				// Only possible for a task created before the server knew
+				// about keys; look it up now rather than failing the task.
+				ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+				key, _ = resolveAPIKey(ctx, taskID)
+				cancel()
+			}
 
 			var result any
 			var sendErr error
@@ -301,7 +337,7 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			for attempt := 1; attempt <= maxRetries; attempt++ {
 				callStart := time.Now()
 				var attemptCost float64
-				result, attemptCost, sendErr = sendMessage(task, action)
+				result, attemptCost, sendErr = sendMessage(task, action, key)
 				callCost += attemptCost
 				callElapsed := time.Since(callStart)
 
@@ -560,6 +596,8 @@ func main() {
 	}
 	costs = loadCostTracker(costStateFile)
 
+	initDB()
+
 	if sharedSecret() == "" {
 		srvLogf("WARNING: CONTROL_SHARED_SECRET is not set — /ws connections are NOT authenticated. Anyone who knows a device ID can drive that computer. Set it (same value in the Next.js app) to turn auth on.")
 	}
@@ -589,6 +627,10 @@ var (
 	// The secret each room's worker registered with (POST /rooms). Kept out
 	// of Task, which is broadcast to every client in full.
 	roomSecrets = map[string]string{}
+
+	// The OpenRouter key each device's current task is billed to (see
+	// keys.go). Kept out of Task for the same reason.
+	taskKeys = map[string]apiKey{}
 
 	mutex sync.Mutex
 )
