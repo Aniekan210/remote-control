@@ -408,6 +408,11 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 	if coords == coordsNorm1000 {
 		res.Actions = norm1000ToPixels(res.Actions, int(w), int(h))
 	}
+	if kept, cut := limitToOneClick(res.Actions); cut > 0 {
+		aiLogf("[%s] batch had mouse actions after its first click: dropped the last %d action(s), the step gets another look", callID, cut)
+		res.Actions = kept
+		res.InstructionDone = false
+	}
 
 	aiLogf("[%s] SUCCESS execution: verdict=%s done=%v reason=%q %d actions: %+v",
 		callID, res.Verdict, res.InstructionDone, res.Reason, len(res.Actions), res.Actions)
@@ -465,6 +470,29 @@ func norm1000ToPixels(actions []Execution, w, h int) []Execution {
 		out[i] = a
 	}
 	return out
+}
+
+// limitToOneClick enforces "at most one screen-changing click per batch,
+// and it's the last mouse action" (F2): the click usually changes the
+// screen, so any mouse action after it aims at coordinates measured on a
+// screen that no longer exists. Everything from the first mouse action
+// after the click is cut (keyboard input right after the click is kept);
+// the caller marks the step not done so the executor gets a fresh
+// screenshot for the rest. A drag (press, move, release) counts as one
+// click, at its release. Returns the kept actions and how many were cut.
+func limitToOneClick(actions []Execution) ([]Execution, int) {
+	clicked := false
+	for i, a := range actions {
+		isMouse := a.Type == "MOUSE_MOVEMENT" || a.Type == "LEFT_CLICK" || a.Type == "RIGHT_CLICK"
+		if clicked && isMouse {
+			return actions[:i], len(actions) - i
+		}
+		// A press with mouse_hold starts a drag; the click is its release.
+		if (a.Type == "LEFT_CLICK" || a.Type == "RIGHT_CLICK") && !a.MouseHold {
+			clicked = true
+		}
+	}
+	return actions, 0
 }
 
 // parseExecResult decodes and validates the executor's output. It is

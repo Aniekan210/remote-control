@@ -26,3 +26,30 @@ func TestNorm1000ToPixels(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 }
+
+func TestLimitToOneClick(t *testing.T) {
+	move := Execution{Type: "MOUSE_MOVEMENT", MousePosX: 1, MousePosY: 1}
+	click := Execution{Type: "LEFT_CLICK"}
+	press := Execution{Type: "LEFT_CLICK", MouseHold: true}
+	holdMove := Execution{Type: "MOUSE_MOVEMENT", MouseHold: true}
+	typing := Execution{Type: "KEYBOARD_INPUT", KeyString: "hi{ENTER}"}
+
+	cases := []struct {
+		name     string
+		in       []Execution
+		wantKept int
+	}{
+		{"single click then typing is fine", []Execution{move, click, typing}, 3},
+		{"second click is cut", []Execution{move, click, move, click}, 2},
+		{"typing between clicks is kept", []Execution{move, click, typing, move, click}, 3},
+		{"a drag is one click", []Execution{move, press, holdMove, click, typing}, 5},
+		{"move after a drag is cut", []Execution{move, press, holdMove, click, move}, 4},
+		{"keyboard only", []Execution{typing, typing}, 2},
+	}
+	for _, c := range cases {
+		kept, cut := limitToOneClick(c.in)
+		if len(kept) != c.wantKept || cut != len(c.in)-c.wantKept {
+			t.Errorf("%s: kept %d cut %d, want kept %d", c.name, len(kept), cut, c.wantKept)
+		}
+	}
+}

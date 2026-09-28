@@ -276,6 +276,11 @@ MOUSE RULES
   in place.
 - A drag is FOUR actions: MOUSE_MOVEMENT to start; LEFT_CLICK mouse_hold=true;
   MOUSE_MOVEMENT to destination mouse_hold=true; LEFT_CLICK mouse_hold=false.
+- At most ONE click (or drag) per response, and it must be your LAST mouse
+  action: a click usually changes the screen, so coordinates for anything
+  after it would be guesses. Typing and keys after the click are fine. If
+  the step needs another click after that, set "instruction_done" to false
+  — you'll get a fresh screenshot and another turn.
 
 ────────────────────────────────────────
 KEYBOARD RULES
