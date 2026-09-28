@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,44 @@ const (
 	// — which is exactly what pixel-accurate clicking needs.
 	defaultExecutionModel = "qwen/qwen2.5-vl-72b-instruct"
 )
+
+// Planner output limits (B5). Reasoning tokens are billed as output tokens
+// and can dominate a planning call's cost, so the planner runs with low
+// reasoning effort and a hard output cap. The cap has to hold the whole
+// JSON plan — a 20-step plan is ~600 tokens — plus the (low) reasoning,
+// which on Gemini counts against the same output budget; 2000 leaves
+// headroom so a long plan is never cut off mid-JSON (a truncated plan
+// costs a full retry, which is worse than the few extra tokens).
+// Both are overridable: PLANNER_MAX_TOKENS, PLANNER_REASONING_EFFORT
+// ("none" disables the reasoning parameter entirely).
+const (
+	defaultPlannerMaxTokens       = 2000
+	defaultPlannerReasoningEffort = "low"
+)
+
+// callOptions are the per-call knobs that differ between planner and
+// executor. Zero values mean "don't send the parameter".
+type callOptions struct {
+	maxTokens       int
+	reasoningEffort string
+}
+
+// plannerOptions returns the planner's output limits.
+func plannerOptions() callOptions {
+	opts := callOptions{maxTokens: defaultPlannerMaxTokens, reasoningEffort: defaultPlannerReasoningEffort}
+	if v := os.Getenv("PLANNER_MAX_TOKENS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			opts.maxTokens = n
+		}
+	}
+	if v := os.Getenv("PLANNER_REASONING_EFFORT"); v != "" {
+		opts.reasoningEffort = v
+	}
+	if opts.reasoningEffort == "none" {
+		opts.reasoningEffort = ""
+	}
+	return opts
+}
 
 // modelForContext returns the model for the current call. planning==true
 // selects the planner, false selects the executor. Both can be overridden
@@ -141,7 +180,7 @@ func callPlanner(callID string, task Task, action Action) (any, float64, error) 
 	}
 
 	response, cost, err := callOpenRouter(callID, "PLANNING", modelForContext(true),
-		plannerSystemPrompt, userContent, "plan", planSchema)
+		plannerSystemPrompt, userContent, "plan", planSchema, plannerOptions())
 	if err != nil {
 		return nil, cost, err
 	}
@@ -198,8 +237,10 @@ func callExecutor(callID string, task Task, action Action) (any, float64, error)
 		screenshotContent(action.ScreenshotPayload),
 	}
 
+	// No output cap for the executor: it's cheap, and a long, careful action
+	// list is worth more than the tokens it saves to cut it short.
 	response, cost, err := callOpenRouter(callID, "EXECUTION", modelForContext(false),
-		executorSystemPrompt, userContent, "actions", executionSchema)
+		executorSystemPrompt, userContent, "actions", executionSchema, callOptions{})
 	if err != nil {
 		return nil, cost, err
 	}
@@ -271,7 +312,7 @@ var schemaUnsupported = struct {
 // that (HTTP 400 mentioning the response format), the call is retried once
 // with plain json_object, and the model is remembered so it isn't tried
 // again. The tolerant parsers downstream stay in place either way.
-func callOpenRouter(callID, mode, model, systemPrompt string, userContent []any, schemaName string, schema map[string]any) (string, float64, error) {
+func callOpenRouter(callID, mode, model, systemPrompt string, userContent []any, schemaName string, schema map[string]any, opts callOptions) (string, float64, error) {
 	var system any = systemPrompt
 	if strings.HasPrefix(model, "anthropic/") {
 		system = []any{map[string]any{
@@ -317,6 +358,12 @@ func callOpenRouter(callID, mode, model, systemPrompt string, userContent []any,
 			// Makes OpenRouter return the call's real cost (usage.cost, in
 			// USD) alongside the token counts, so every call can be priced.
 			"usage": map[string]any{"include": true},
+		}
+		if opts.maxTokens > 0 {
+			requestBody["max_tokens"] = opts.maxTokens
+		}
+		if opts.reasoningEffort != "" {
+			requestBody["reasoning"] = map[string]any{"effort": opts.reasoningEffort}
 		}
 
 		content, cost, status, err := postChatCompletion(callID, mode, model, requestBody)
@@ -444,6 +491,11 @@ func postChatCompletion(callID, mode, model string, requestBody map[string]any) 
 		callID, mode, model, result.Usage.PromptTokens, result.Usage.PromptTokensDetails.CachedTokens,
 		result.Usage.CompletionTokens, result.Usage.CompletionTokensDetails.ReasoningTokens,
 		result.Usage.TotalTokens, cost, day, month)
+
+	if mode == "EXECUTION" && result.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
+		aiLogf("[%s] WARNING: executor model=%s spent %d reasoning tokens — the executor should not be a reasoning model (slow and billed as output); pick a non-reasoning EXECUTION_MODEL",
+			callID, model, result.Usage.CompletionTokensDetails.ReasoningTokens)
+	}
 
 	if len(result.Choices) == 0 {
 		aiLogf("[%s] FAILED no choices in response, raw body: %s", callID, string(rawBody))
