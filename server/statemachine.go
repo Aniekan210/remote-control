@@ -315,6 +315,7 @@ func applyPlan(t Task, p PlanResult, image string) Task {
 	t.Context = false // next ADVANCE generates executions, not a new plan
 	t.Reason = ""
 	t.InstrAttempts = 0
+	t.StepActions = nil
 	t.ExecutionList = make([]Execution, 0)
 	if t.ConfirmedIndex >= idx {
 		// The steps from idx on are new; an approval was for the old ones.
@@ -362,11 +363,15 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 			srvLogf("device=%s: final check passed, task COMPLETED", t.DeviceID)
 			return t
 		case verdictAct:
-			t.ExecutionList = res.Actions
-			t.InstrAttempts++
-			srvLogf("device=%s: final check found the task unfinished, running %d fix-up actions: %+v",
-				t.DeviceID, len(res.Actions), res.Actions)
-			return t
+			// Don't let the executor improvise fix-ups after the plan is
+			// done — it's a step-follower, not a planner. Hand it back to
+			// the planner with what the executor noticed.
+			reason := "The final check found the task isn't finished yet."
+			if res.Reason != "" {
+				reason = "The final check found the task isn't finished: " + res.Reason
+			}
+			srvLogf("device=%s: final check says unfinished, replanning instead of improvising: %s", t.DeviceID, reason)
+			return requestReplan(t, reason, image)
 		}
 	}
 
@@ -376,8 +381,12 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 		if res.InstructionDone {
 			t.CurrentInstructionIndex++
 			t.InstrAttempts = 0
+			t.StepActions = nil
 		} else {
+			// The executor will look at this step again; tell it what it
+			// already did so it continues instead of starting over.
 			t.InstrAttempts++
+			t.StepActions = append(t.StepActions, describeActions(res.Actions)...)
 		}
 		srvLogf("device=%s: executor act: %d actions for instruction %d/%d (done=%v): %+v",
 			t.DeviceID, len(res.Actions), t.CurrentInstructionIndex, len(t.InstructionList), res.InstructionDone, res.Actions)
@@ -386,6 +395,7 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 		t.ExecutionList = make([]Execution, 0)
 		t.CurrentInstructionIndex++
 		t.InstrAttempts = 0
+		t.StepActions = nil
 		srvLogf("device=%s: executor skip: instruction already done on screen, now %d/%d",
 			t.DeviceID, t.CurrentInstructionIndex, len(t.InstructionList))
 
@@ -398,6 +408,37 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 		t = askUser(t, "blocked", res.Reason, image)
 	}
 	return t
+}
+
+// describeActions turns a batch into short lines for the executor's
+// "already done for this step" list, e.g. `clicked at (412, 88)`.
+func describeActions(actions []Execution) []string {
+	var out []string
+	x, y := -1, -1
+	for _, a := range actions {
+		switch a.Type {
+		case "MOUSE_MOVEMENT":
+			x, y = a.MousePosX, a.MousePosY
+		case "LEFT_CLICK", "RIGHT_CLICK":
+			what := "clicked"
+			if a.Type == "RIGHT_CLICK" {
+				what = "right-clicked"
+			}
+			if a.MouseHold {
+				what = "pressed the mouse button"
+			}
+			if x >= 0 {
+				out = append(out, fmt.Sprintf("%s at (%d, %d)", what, x, y))
+			} else {
+				out = append(out, what)
+			}
+		case "KEYBOARD_INPUT":
+			out = append(out, fmt.Sprintf("typed %q", a.KeyString))
+		case "WAIT":
+			out = append(out, fmt.Sprintf("waited %d ms", a.Ms))
+		}
+	}
+	return out
 }
 
 // requestReplan asks the worker for fresh context so the planner can
@@ -417,6 +458,7 @@ func requestReplan(t Task, reason, image string) Task {
 	t.ExecutionList = make([]Execution, 0)
 	t.Reason = reason
 	t.InstrAttempts = 0
+	t.StepActions = nil
 	t.Status = "RUNNING"
 	return t
 }

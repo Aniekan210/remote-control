@@ -40,8 +40,9 @@ type Task struct {
 	CostBase     float64   `json:"-"` // CostUSD at the start of the current window
 	StartedAt    time.Time `json:"-"` // start of the current window, for MAX_TASK_DURATION
 
-	InstrAttempts int  `json:"-"` // executor calls on the current instruction (capped, then replan)
-	InFlight      bool `json:"-"` // an AI call for the current Seq is running; further ADVANCEs for it are duplicates
+	InstrAttempts int      `json:"-"` // executor calls on the current instruction (capped, then replan)
+	StepActions   []string `json:"-"` // what earlier batches already did for the current instruction (shown to the executor)
+	InFlight      bool     `json:"-"` // an AI call for the current Seq is running; further ADVANCEs for it are duplicates
 }
 
 type Execution struct {

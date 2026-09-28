@@ -389,6 +389,31 @@ func TestStateMachine(t *testing.T) {
 			mustEqual(t, "error", task.LastError, "OpenRouter rejected the API key. Check it in Settings.")
 		}},
 
+		{"final check never improvises: act becomes a replan", func(t *testing.T) {
+			task := running(t, "a")
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "", click))
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "video isn't playing", click))
+			mustEqual(t, "no fix-up actions run", len(task.ExecutionList), 0)
+			mustEqual(t, "replan", task.Context, true)
+			mustEqual(t, "status", task.Status, "RUNNING")
+		}},
+
+		{"a second look at a step knows what was already done", func(t *testing.T) {
+			task := running(t, "open the File menu and choose Save")
+			task = onClientAction(task, advance(task.Seq))
+			move := Execution{Type: "MOUSE_MOVEMENT", MousePosX: 12, MousePosY: 30}
+			task = onAIResult(task, exec(task, verdictAct, false, "", move, click))
+			mustEqual(t, "history", strings.Join(task.StepActions, "|"), "clicked at (12, 30)")
+			if !strings.Contains(executorUserText(task, task.InstructionList[0], 0, 100, 100), "Already done for this step") {
+				t.Fatal("executor isn't told what it already did")
+			}
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "", click))
+			mustEqual(t, "history cleared on the next step", len(task.StepActions), 0)
+		}},
+
 		{"refused CREATE_TASK", func(t *testing.T) {
 			a := create("x")
 			a.Refused = "Add your OpenRouter key in Settings"

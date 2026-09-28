@@ -57,6 +57,7 @@ const (
 type callOptions struct {
 	maxTokens       int
 	reasoningEffort string
+	temperature     *float64
 }
 
 // plannerOptions returns the planner's output limits.
@@ -91,6 +92,21 @@ func executionCoords() string {
 		return coordsNorm1000
 	}
 	return coordsPixels
+}
+
+// executorOptions: the executor runs at temperature 0 (EXECUTOR_TEMPERATURE
+// overrides). Clicking the right pixel and following one step is a
+// precision job; OpenRouter's default of 1.0 made it wander — clicking
+// near things, or doing more than the step asked. No output cap: a long,
+// careful action list is worth more than the tokens it saves.
+func executorOptions() callOptions {
+	t := 0.0
+	if v := os.Getenv("EXECUTOR_TEMPERATURE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			t = f
+		}
+	}
+	return callOptions{temperature: &t}
 }
 
 // modelForContext returns the model for the current call. planning==true
@@ -392,11 +408,9 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 		screenshotContent(action.ScreenshotPayload),
 	}
 
-	// No output cap for the executor: it's cheap, and a long, careful action
-	// list is worth more than the tokens it saves to cut it short.
 	coords := executionCoords()
 	response, cost, err := callOpenRouter(callID, "EXECUTION", modelForContext(false),
-		executorPrompt(coords), userContent, "actions", executionSchema, callOptions{}, key)
+		executorPrompt(coords), userContent, "actions", executionSchema, executorOptions(), key)
 	if err != nil {
 		return nil, cost, err
 	}
@@ -426,10 +440,22 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 // the plan expects (E3): the overall task, the whole plan with the current
 // step marked, the previous step, and the user's answers so far.
 func executorUserText(task Task, instruction string, idx int, w, h uint32) string {
+	final := idx >= len(task.InstructionList)
 	var b strings.Builder
-	fmt.Fprintf(&b, "Instruction: %s\n\n", instruction)
-	fmt.Fprintf(&b, "Overall task: %s\n\n", task.Description)
-	b.WriteString("Plan:\n")
+	if final {
+		fmt.Fprintf(&b, "FINAL CHECK: %s\n\n", instruction)
+	} else {
+		fmt.Fprintf(&b, "CURRENT STEP (do ONLY this): %s\n\n", instruction)
+	}
+	if len(task.StepActions) > 0 {
+		b.WriteString("Already done for this step (the screenshot shows the result — do NOT repeat these; if the step is now complete, answer skip):\n")
+		for i, a := range task.StepActions {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, a)
+		}
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, "Overall task (context only): %s\n\n", task.Description)
+	b.WriteString("Plan (context only — never do other steps; they get their own turn):\n")
 	for i, step := range task.InstructionList {
 		marker := "   "
 		if i == idx {
@@ -437,11 +463,10 @@ func executorUserText(task Task, instruction string, idx int, w, h uint32) strin
 		}
 		fmt.Fprintf(&b, "%s%d. %s\n", marker, i+1, step)
 	}
-	if idx >= len(task.InstructionList) && len(task.InstructionList) > 0 {
-		b.WriteString("\nAll steps above have been carried out; this is the final check.\n")
-		fmt.Fprintf(&b, "Previous step: %s\n", task.InstructionList[len(task.InstructionList)-1])
+	if final && len(task.InstructionList) > 0 {
+		b.WriteString("\nAll steps above have been carried out; this is the final check. Answer skip if the task is done, otherwise replan or blocked with a reason. Do not act.\n")
 	} else if idx > 0 && idx-1 < len(task.InstructionList) {
-		fmt.Fprintf(&b, "\nPrevious step: %s\n", task.InstructionList[idx-1])
+		fmt.Fprintf(&b, "\nPrevious step (should already be done on screen): %s\n", task.InstructionList[idx-1])
 	} else {
 		b.WriteString("\nPrevious step: (none — this is the first step)\n")
 	}
@@ -455,6 +480,9 @@ func executorUserText(task Task, instruction string, idx int, w, h uint32) strin
 		fmt.Fprintf(&b, "\nScreenshot size: %dx%d pixels. Give coordinates normalized to 0–1000, not pixels.", w, h)
 	} else {
 		fmt.Fprintf(&b, "\nScreenshot size: %dx%d pixels (0 <= x < %d, 0 <= y < %d).", w, h, w, h)
+	}
+	if !final {
+		fmt.Fprintf(&b, "\n\nReminder — the only step to carry out now: %s", instruction)
 	}
 	return b.String()
 }
@@ -643,6 +671,9 @@ func callOpenRouter(callID, mode, model, systemPrompt string, userContent []any,
 		}
 		if opts.maxTokens > 0 {
 			requestBody["max_tokens"] = opts.maxTokens
+		}
+		if opts.temperature != nil {
+			requestBody["temperature"] = *opts.temperature
 		}
 		if opts.reasoningEffort != "" {
 			requestBody["reasoning"] = map[string]any{"effort": opts.reasoningEffort}
