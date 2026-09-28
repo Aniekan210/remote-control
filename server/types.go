@@ -1,5 +1,7 @@
 package main
 
+import "time"
+
 type StateUpdate struct {
 	Type    string `json:"type"`
 	Payload Task   `json:"payload"`
@@ -19,6 +21,15 @@ type Task struct {
 	ExecutionList           []Execution `json:"execution_list"`   // list of executions after AI solves singular instruction
 	Context                 bool        `json:"context"`          // boolean asking for context from the desktop worker
 	CostUSD                 float64     `json:"cost_usd"`         // total OpenRouter spend on this task so far
+	LastError               string      `json:"last_error"`       // one-off error for the client (budget reached, ...); cleared on the next accepted action
+
+	// Server-only bookkeeping for the per-task caps. json:"-" keeps these
+	// out of the TASK_UPDATE broadcast; they live in taskHashTable only.
+	AICalls      int       `json:"-"` // AI calls since the task started (or since the last "continue")
+	PlannerCalls int       `json:"-"` // planning calls, same window
+	CostBase     float64   `json:"-"` // CostUSD at the start of the current window
+	StartedAt    time.Time `json:"-"` // start of the current window, for MAX_TASK_DURATION
+	CapHit       bool      `json:"-"` // paused because a per-task cap was reached
 }
 
 type Execution struct {

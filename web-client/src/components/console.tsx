@@ -125,6 +125,12 @@ export function Console({ deviceId, deviceLabel }: { deviceId: string; deviceLab
       {status && (
         <div className="pb-safe fixed inset-x-0 bottom-0 z-20 bg-gradient-to-t from-ink via-ink to-ink/0 pt-8">
           <div className="mx-auto max-w-xl px-4">
+            {task?.lastError && (
+              <p role="alert" className="mb-2 px-1 font-mono text-[12px] leading-snug text-danger">
+                {task.lastError}
+              </p>
+            )}
+
             {status === "NONE" && (
               <Composer
                 disabled={!live || busy}

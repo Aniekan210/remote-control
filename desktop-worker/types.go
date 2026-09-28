@@ -18,6 +18,7 @@ type Task struct {
 	ExecutionList           []Execution `json:"execution_list"`
 	Context                 bool        `json:"context"`
 	CostUSD                 float64     `json:"cost_usd"`
+	LastError               string      `json:"last_error"`
 }
 
 type Execution struct {

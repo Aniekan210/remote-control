@@ -19,6 +19,8 @@ export type Task = {
   planning: boolean;
   /** OpenRouter spend on this task so far, in USD */
   costUsd: number;
+  /** one-off error from the server (budget reached, missing key…); cleared on the next accepted action */
+  lastError: string;
 };
 
 export const EMPTY_TASK: Task = {
@@ -30,6 +32,7 @@ export const EMPTY_TASK: Task = {
   executionList: [],
   planning: false,
   costUsd: 0,
+  lastError: "",
 };
 
 type Obj = Record<string, unknown>;
@@ -60,6 +63,7 @@ export function normalizeTask(raw: unknown): Task {
       : [],
     planning: Boolean(pick(o, "Context", "context")),
     costUsd: Number(pick(o, "CostUSD", "costUsd", "cost_usd") ?? 0) || 0,
+    lastError: String(pick(o, "LastError", "lastError", "last_error") ?? ""),
   };
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -160,8 +161,24 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 		task := taskHashTable[taskID]
 		prevStatus := task.Status
 
+		// A one-off error is shown until the next accepted client action.
+		switch action.Type {
+		case "CREATE_TASK", "PAUSE_TASK", "RESUME_TASK", "CANCEL_TASK":
+			task.LastError = ""
+		}
+
 		switch action.Type {
 		case "CREATE_TASK":
+			// The monthly budget protects the server's own OpenRouter key:
+			// once it's spent, new tasks are refused (the running one, if
+			// any, is left alone) and the client is told why.
+			if spent := costs.monthTotal(); spent >= limits.MonthlyBudgetUSD {
+				task.LastError = "Monthly AI budget reached"
+				srvLogf("device=%s: CREATE_TASK refused, monthly budget reached ($%.4f of $%.2f)",
+					taskID, spent, limits.MonthlyBudgetUSD)
+				break
+			}
+
 			// Full reset, not just overwrite: a device that ran a previous
 			// task (completed, paused, or otherwise not explicitly
 			// CANCEL_TASK'd) still has that task's leftover
@@ -183,6 +200,7 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				InstructionList:         make([]string, 0),
 				ExecutionList:           make([]Execution, 0),
 				Context:                 true,
+				StartedAt:               time.Now(),
 			}
 			srvLogf("device=%s: CREATE_TASK description=%q (full state reset)", taskID, action.Description)
 
@@ -213,7 +231,22 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// Release the lock before the network call so a slow request
+			// Per-task caps: a runaway task (looping, or just long) stops
+			// spending before the next call. Hitting a cap doesn't fail the
+			// task — it pauses it with an explanation, and resuming grants
+			// a fresh window of calls/spend/time.
+			if reason := taskCapReached(task, time.Now()); reason != "" {
+				task.Status = "PAUSED"
+				task.CapHit = true
+				task.LastError = reason
+				// The worker already ran this list (that's what this ADVANCE
+				// reports), so clear it: on resume the worker then just sends
+				// a fresh ADVANCE instead of replaying the last batch.
+				task.ExecutionList = make([]Execution, 0)
+				srvLogf("device=%s: per-task cap reached, pausing: %s", taskID, reason)
+				break
+			}
+
 			// Release the lock before the network call so a slow request
 			// (or our retries) don't block every other room's messages
 			// from being processed while we wait on the AI.
@@ -222,6 +255,7 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			var result any
 			var sendErr error
 			var callCost float64
+			wasPlanning := task.Context
 
 			const maxRetries = 3
 			for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -256,6 +290,10 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			// call was in flight (a reset task starts again from $0).
 			if task.Status != "NONE" {
 				task.CostUSD += callCost
+				task.AICalls++
+				if wasPlanning {
+					task.PlannerCalls++
+				}
 			}
 
 			switch {
@@ -319,6 +357,16 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			srvLogf("device=%s: PAUSE_TASK", taskID)
 		case "RESUME_TASK":
 			task.Status = "RUNNING"
+			if task.CapHit {
+				// Resuming after a cap means "yes, keep going": start a fresh
+				// window of calls/spend/time for this task.
+				task.CapHit = false
+				task.AICalls = 0
+				task.PlannerCalls = 0
+				task.CostBase = task.CostUSD
+				task.StartedAt = time.Now()
+				srvLogf("device=%s: per-task caps reset after the user chose to continue", taskID)
+			}
 			srvLogf("device=%s: RESUME_TASK", taskID)
 		case "CANCEL_TASK":
 			task = resetTask(task.DeviceID)
@@ -347,6 +395,27 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 		// Network I/O happens AFTER releasing the mutex.
 		broadcastToTaskRoom(r.Context(), taskID, task, clients)
 	}
+}
+
+// taskCapReached returns a user-facing explanation when the task has hit
+// one of the per-task caps (calls, planner calls, spend, running time), or
+// "" when it may make another AI call. The planner cap only applies when
+// the next call is a planner call (Context == true).
+func taskCapReached(t Task, now time.Time) string {
+	spent := t.CostUSD - t.CostBase
+	used := fmt.Sprintf("This task has used %d AI calls / $%.3f", t.AICalls, t.CostUSD)
+	switch {
+	case t.AICalls >= limits.MaxAICallsPerTask:
+		return used + fmt.Sprintf(" (limit %d calls). Continue?", limits.MaxAICallsPerTask)
+	case t.Context && t.PlannerCalls >= limits.MaxPlannerCallsPerTask:
+		return used + fmt.Sprintf(" and planned %d times (limit %d). Continue?", t.PlannerCalls, limits.MaxPlannerCallsPerTask)
+	case spent >= limits.MaxTaskCostUSD:
+		return used + fmt.Sprintf(" (limit $%.2f). Continue?", limits.MaxTaskCostUSD)
+	case !t.StartedAt.IsZero() && now.Sub(t.StartedAt) >= limits.MaxTaskDuration:
+		return used + fmt.Sprintf(" and has run for %s (limit %s). Continue?",
+			now.Sub(t.StartedAt).Round(time.Second), limits.MaxTaskDuration)
+	}
+	return ""
 }
 
 // resetTask returns a fresh, empty task for the given device — the same
@@ -439,6 +508,17 @@ func main() {
 	} else {
 		srvLogf(".env file loaded")
 	}
+
+	limits = loadLimits()
+	srvLogf("limits: %d AI calls, %d planner calls, $%.2f and %s per task; $%.2f/month on the server key",
+		limits.MaxAICallsPerTask, limits.MaxPlannerCallsPerTask, limits.MaxTaskCostUSD,
+		limits.MaxTaskDuration, limits.MonthlyBudgetUSD)
+
+	costStateFile := os.Getenv("COST_STATE_FILE")
+	if costStateFile == "" {
+		costStateFile = "cost-state.json"
+	}
+	costs = loadCostTracker(costStateFile)
 
 	// HTTP REST endpoint
 	http.HandleFunc("/rooms", handleCreateRoom)
