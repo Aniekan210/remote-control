@@ -60,6 +60,11 @@ type Action struct {
 	ScreenshotPayload Screenshot  `json:"screenshot_payload"`
 	Error             string      `json:"error"` // for ADVANCE: the worker couldn't carry out the last step (screenshot failed, bad coordinates, unknown action)
 	Seq               int         `json:"seq"`   // for ADVANCE: the Task.Seq the worker acted on; stale ones are ignored
+
+	// Set by the server, never by a client (json:"-"), so the state
+	// machine stays pure: see onClientAction.
+	ReceivedAt time.Time `json:"-"` // when the action arrived
+	Refused    string    `json:"-"` // CREATE_TASK only: why the task can't start (shown as last_error)
 }
 
 type FileEntry struct {

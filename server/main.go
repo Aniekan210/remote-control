@@ -1,15 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -199,612 +198,170 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Resolve which OpenRouter key a new task is billed to before
-		// taking the lock: it's a database round trip.
+		action.ReceivedAt = time.Now()
+
+		// Anything needing I/O is worked out before taking the lock, and
+		// handed to the (pure) state machine inside the action.
 		var newKey apiKey
-		var newKeyErr error
 		if action.Type == "CREATE_TASK" {
-			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-			newKey, newKeyErr = resolveAPIKey(ctx, taskID)
-			cancel()
+			newKey, action.Refused = checkCanStart(r.Context(), taskID)
 		}
 
 		mutex.Lock()
 
-		task := taskHashTable[taskID]
-		prevStatus := task.Status
-		prevSeq := task.Seq
-		// bump marks a transition the worker must act on (E9): Seq goes up
-		// by one, and any ADVANCE or AI result for the old Seq is stale.
-		// Pause/resume don't bump: the worker's state is the same after a
-		// resume, and it re-sends its ADVANCE for that Seq (see the worker's
-		// RunExecutor).
-		bump := false
+		prev := taskHashTable[taskID]
+		task := onClientAction(prev, action)
+		startCall := task.InFlight && !prev.InFlight
+		changed := visibleChange(prev, task)
 
-		// A one-off error is shown until the next accepted client action.
-		switch action.Type {
-		case "CREATE_TASK", "PAUSE_TASK", "RESUME_TASK", "CANCEL_TASK", "ANSWER":
-			task.LastError = ""
-		}
-
-		switch action.Type {
-		case "CREATE_TASK":
-			// Every task needs a key to bill: the user's own, or the
-			// server's for an owner (OWNER_USER_IDS). Without one the task
-			// is refused and the client is told what to do.
-			if newKeyErr != nil {
-				if errors.Is(newKeyErr, errNoKey) {
-					task.LastError = errNoKey.Error()
-				} else {
-					task.LastError = "Couldn't look up your OpenRouter key. Try again."
-				}
-				srvLogf("device=%s: CREATE_TASK refused, no usable OpenRouter key: %v", taskID, newKeyErr)
-				break
-			}
-
-			// The monthly budget protects the server's own OpenRouter key:
-			// once it's spent, new tasks on it are refused (the running
-			// one, if any, is left alone) and the client is told why.
-			// Users' own keys are theirs to limit.
-			if spent := costs.serverMonthTotal(); newKey.serverKey && spent >= limits.MonthlyBudgetUSD {
-				task.LastError = "Monthly AI budget reached"
-				srvLogf("device=%s: CREATE_TASK refused, monthly budget reached ($%.4f of $%.2f)",
-					taskID, spent, limits.MonthlyBudgetUSD)
-				break
-			}
+		if action.Type == "CREATE_TASK" && action.Refused == "" {
 			taskKeys[taskID] = newKey
-
-			// Full reset, not just overwrite: a device that ran a previous
-			// task (completed, paused, or otherwise not explicitly
-			// CANCEL_TASK'd) still has that task's leftover
-			// CurrentInstructionIndex/InstructionList/ExecutionList sitting
-			// in taskHashTable — CREATE_TASK used to only touch
-			// Description/Context/Status, so a stale non-empty
-			// ExecutionList would survive into the new task. The worker's
-			// executor treats "ExecutionList non-empty" as "re-run these
-			// actions" unconditionally, so it would replay the OLD task's
-			// last batch of clicks/keystrokes instead of sending the
-			// ADVANCE that starts planning the NEW task — which looks
-			// exactly like "ADVANCE is never sent" from the server's side,
-			// since the worker is busy doing something else instead.
-			task = Task{
-				DeviceID:                taskID,
-				Description:             action.Description,
-				Status:                  "RUNNING",
-				CurrentInstructionIndex: 0,
-				InstructionList:         make([]string, 0),
-				ExecutionList:           make([]Execution, 0),
-				Context:                 true,
-				Answers:                 make([]string, 0),
-				ConfirmedIndex:          -1,
-				NeedsConfirm:            make([]bool, 0),
-				StartedAt:               time.Now(),
-			}
-			bump = true
-			srvLogf("device=%s: CREATE_TASK description=%q (full state reset)", taskID, action.Description)
-
-		case "ADVANCE":
-			srvLogf("device=%s: ADVANCE received, seq=%d (task seq=%d) context=%v currentInstrIdx=%d/%d screenshotBytes=%d fsEntries=%d",
-				taskID, action.Seq, task.Seq, task.Context, task.CurrentInstructionIndex, len(task.InstructionList),
-				len(action.ScreenshotPayload.Data), len(action.FileSystemPayload))
-
-			// Only an ADVANCE for the current state counts, once (E9).
-			// Without this, two in-flight ADVANCEs (e.g. around a
-			// reconnect) both advanced the task and skipped a step. Seq 0
-			// is a worker from before sequence numbers: accepted, but still
-			// de-duplicated by InFlight.
-			switch {
-			case task.Status != "RUNNING":
-				srvLogf("device=%s: ignoring ADVANCE, task is %s", taskID, task.Status)
-				mutex.Unlock()
-				continue
-			case action.Seq != 0 && action.Seq != task.Seq:
-				srvLogf("device=%s: ignoring stale ADVANCE (seq %d, task is at %d)", taskID, action.Seq, task.Seq)
-				mutex.Unlock()
-				continue
-			case task.InFlight:
-				srvLogf("device=%s: ignoring duplicate ADVANCE, an AI call for seq %d is already running", taskID, task.Seq)
-				mutex.Unlock()
-				continue
-			}
-			bump = true // every outcome below is new work for the worker
-
-			// The worker couldn't do what it was told (the screenshot
-			// failed twice, coordinates off the screen, an action type it
-			// doesn't know). That's the screen not matching the plan, as
-			// far as recovery goes: revise it, no executor call.
-			if action.Error != "" {
-				srvLogf("device=%s: worker reported an error, replanning: %s", taskID, action.Error)
-				task = requestReplan(task, "The computer couldn't carry out the last step: "+action.Error,
-					screenshotDataURL(action.ScreenshotPayload))
-				break
-			}
-
-			// Past the last step, the next executor call is the final
-			// check (see callExecutor): the task is only COMPLETED once
-			// the executor has looked at the screen and agrees it's done.
-			if !task.Context && task.CurrentInstructionIndex >= len(task.InstructionList) {
-				srvLogf("device=%s: all instructions executed, running the final check", taskID)
-			}
-
-			// Irreversible steps (send, submit, delete, purchase, post,
-			// close unsaved work) wait for the user's approval before the
-			// executor even looks at them. No AI call for the question.
-			if needsConfirmation(task) {
-				step := task.InstructionList[task.CurrentInstructionIndex]
-				srvLogf("device=%s: step %d needs approval before it runs: %q", taskID, task.CurrentInstructionIndex+1, step)
-				task = askUser(task, "confirm", "About to: "+step, screenshotDataURL(action.ScreenshotPayload))
-				break
-			}
-
-			// Per-task caps: a runaway task (looping, or just long) stops
-			// spending before the next call. Hitting a cap doesn't fail the
-			// task — it becomes a budget question, and answering it grants
-			// a fresh window of calls/spend/time.
-			if reason := taskCapReached(task, time.Now()); reason != "" {
-				srvLogf("device=%s: per-task cap reached, asking the user: %s", taskID, reason)
-				task = askUser(task, "budget", reason, screenshotDataURL(action.ScreenshotPayload))
-				break
-			}
-
-			// A step that still isn't done after maxExecutorCallsPerStep
-			// executor calls won't be fixed by a fourth: the plan is off.
-			if !task.Context && task.InstrAttempts >= maxExecutorCallsPerStep {
-				srvLogf("device=%s: instruction %d not done after %d executor calls, replanning",
-					taskID, task.CurrentInstructionIndex, task.InstrAttempts)
-				reason := fmt.Sprintf("The task still wasn't complete after %d final checks.", task.InstrAttempts)
-				if task.CurrentInstructionIndex < len(task.InstructionList) {
-					reason = fmt.Sprintf("Step %d (%q) still wasn't done after %d attempts.",
-						task.CurrentInstructionIndex+1, task.InstructionList[task.CurrentInstructionIndex], task.InstrAttempts)
-				}
-				task = requestReplan(task, reason, screenshotDataURL(action.ScreenshotPayload))
-				break
-			}
-
-			key, haveKey := taskKeys[taskID]
-
-			// Release the lock before the network call so a slow request
-			// (or our retries) don't block every other room's messages
-			// from being processed while we wait on the AI. InFlight is
-			// stored first, so a duplicate ADVANCE meanwhile is ignored.
-			task.InFlight = true
-			taskHashTable[taskID] = task
-			callSeq := task.Seq
-			mutex.Unlock()
-
-			if !haveKey {
-				// Only possible for a task created before the server knew
-				// about keys; look it up now rather than failing the task.
-				ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-				key, _ = resolveAPIKey(ctx, taskID)
-				cancel()
-			}
-
-			var result any
-			var sendErr error
-			var callCost float64
-			wasPlanning := task.Context
-
-			const maxRetries = 3
-			for attempt := 1; attempt <= maxRetries; attempt++ {
-				callStart := time.Now()
-				var attemptCost float64
-				result, attemptCost, sendErr = sendMessage(task, action, key)
-				callCost += attemptCost
-				callElapsed := time.Since(callStart)
-
-				if sendErr == nil {
-					srvLogf("device=%s: sendMessage attempt %d/%d succeeded in %s",
-						taskID, attempt, maxRetries, callElapsed)
-					break
-				}
-				srvLogf("device=%s: sendMessage attempt %d/%d FAILED after %s: %v",
-					taskID, attempt, maxRetries, callElapsed, sendErr)
-				if attempt < maxRetries {
-					backoff := time.Duration(attempt) * time.Second
-					srvLogf("device=%s: retrying in %s", taskID, backoff)
-					time.Sleep(backoff) // 1s, 2s backoff
-				}
-			}
-
-			mutex.Lock()
-
-			// Re-read current state: another message (PAUSE/CANCEL/ANSWER/
-			// a new task) may have landed while we were waiting on the
-			// network call.
-			task = taskHashTable[taskID]
-
-			if task.Seq != callSeq {
-				// Cancelled, replaced, or otherwise moved on while the call
-				// was in flight: the result is for a state that no longer
-				// exists. Drop it (the month total already has its cost).
-				srvLogf("device=%s: dropping stale AI result for seq %d, task is now at seq %d (%s)",
-					taskID, callSeq, task.Seq, task.Status)
-				mutex.Unlock()
-				continue
-			}
-
-			task.InFlight = false
-			task.CostUSD += callCost
-			task.AICalls++
-			if wasPlanning {
-				task.PlannerCalls++
-			}
-
-			switch {
-			case sendErr != nil:
-				// Never remaking a room, so give up by resetting the task
-				// to a clean slate instead of deleting it from the table.
-				srvLogf("device=%s: giving up after %d attempts, resetting task to NONE: %v",
-					taskID, maxRetries, sendErr)
-				task = resetTask(task.DeviceID)
-				task.LastError = "The AI calls kept failing, so the task was stopped. Try again."
-
-			case task.Status != "RUNNING":
-				// Paused while the call was in flight (the person took
-				// over the mouse, or paused from the phone): the screen may
-				// no longer be what the AI saw, so drop the result. The
-				// worker re-sends its ADVANCE for this Seq on resume and a
-				// fresh call is made then.
-				srvLogf("device=%s: dropping AI result, task was %s while the call was in flight",
-					taskID, task.Status)
-				bump = false
-
-			case task.Context:
-				// Planning call: a first plan, or a revision of the rest.
-				plan, ok := result.(PlanResult)
-				if !ok {
-					srvLogf("device=%s: expected PlanResult from planning call, got %T (value: %+v) — resetting task",
-						taskID, result, result)
-					task = resetTask(task.DeviceID)
-					break
-				}
-				task = applyPlan(task, plan, screenshotDataURL(action.ScreenshotPayload))
-
-			default:
-				// Execution call: result is the executor's verdict on the
-				// screen for the current instruction.
-				res, ok := result.(ExecResult)
-				if !ok {
-					srvLogf("device=%s: expected ExecResult from execution call, got %T (value: %+v) — resetting task",
-						taskID, result, result)
-					task = resetTask(task.DeviceID)
-					break
-				}
-				task = applyExecResult(task, res, screenshotDataURL(action.ScreenshotPayload))
-			}
-
-		case "PAUSE_TASK":
-			if task.Status != "RUNNING" {
-				srvLogf("device=%s: ignoring PAUSE_TASK, task is %s", taskID, task.Status)
-				mutex.Unlock()
-				continue
-			}
-			task.Status = "PAUSED"
-			srvLogf("device=%s: PAUSE_TASK", taskID)
-		case "RESUME_TASK":
-			if task.Status != "PAUSED" {
-				srvLogf("device=%s: ignoring RESUME_TASK, task is %s", taskID, task.Status)
-				mutex.Unlock()
-				continue
-			}
-			task.Status = "RUNNING"
-			srvLogf("device=%s: RESUME_TASK", taskID)
-		case "ANSWER":
-			if task.Status != "NEEDS_INPUT" {
-				srvLogf("device=%s: ignoring ANSWER, task is %s (not waiting on a question)", taskID, task.Status)
-				mutex.Unlock()
-				continue
-			}
-			answer := strings.TrimSpace(action.Description)
-			if answer == "" && task.QuestionKind != "budget" {
-				srvLogf("device=%s: ignoring empty ANSWER", taskID)
-				mutex.Unlock()
-				continue
-			}
-			srvLogf("device=%s: ANSWER to %s question %q: %q", taskID, task.QuestionKind, task.Question, answer)
-			task = applyAnswer(task, answer, time.Now())
-			bump = true
-		case "CANCEL_TASK":
-			task = resetTask(task.DeviceID)
-			bump = true
-			srvLogf("device=%s: CANCEL_TASK, task reset", taskID)
-		default:
-			srvLogf("device=%s: unknown action type: %q", taskID, action.Type)
-			mutex.Unlock()
-			continue
 		}
-
-		if bump {
-			task.Seq = prevSeq + 1
-		}
-
-		if task.Status != prevStatus {
-			srvLogf("device=%s: status transition %s -> %s", taskID, prevStatus, task.Status)
+		if task.Status != prev.Status {
+			srvLogf("device=%s: status transition %s -> %s", taskID, prev.Status, task.Status)
 		}
 
 		taskHashTable[taskID] = task
-
-		// Copy the clients while we have the lock.
-		clients := make([]*websocket.Conn, 0, len(rooms[taskID]))
-
-		for client := range rooms[taskID] {
-			clients = append(clients, client)
-		}
+		clients := roomClients(taskID)
 
 		mutex.Unlock()
 
 		// Network I/O happens AFTER releasing the mutex.
-		broadcastToTaskRoom(r.Context(), taskID, task, clients)
+		if changed {
+			broadcastToTaskRoom(r.Context(), taskID, task, clients)
+		}
+
+		// The AI call runs on its own goroutine, so this connection keeps
+		// reading while it's in flight — a PAUSE_TASK from the worker (the
+		// person grabbed the mouse) lands immediately instead of queueing
+		// behind a call that can take a minute with retries.
+		if startCall {
+			go runAICall(taskID, task, action)
+		}
 	}
 }
 
-// applyPlan applies the planner's answer.
-//   - continue: a first plan replaces the (empty) list; a revise keeps the
-//     completed steps (list[:idx]) and replaces everything after with the
-//     new remaining steps. Either way execution carries on at idx.
-//   - ask:      the planner can't decide safely — ask the user (the answer
-//     comes back through a revise)
-//   - stop:     nothing more to do — COMPLETED
-func applyPlan(t Task, p PlanResult, image string) Task {
-	switch p.Decision {
-	case decisionAsk:
-		srvLogf("device=%s: planner asks the user: %s", t.DeviceID, p.Message)
-		t.Context = false
-		t.Reason = ""
-		return askUser(t, "blocked", p.Message, image)
-
-	case decisionStop:
-		srvLogf("device=%s: planner says stop: %s — task COMPLETED", t.DeviceID, p.Message)
-		t.Context = false
-		t.Reason = ""
-		t.ExecutionList = make([]Execution, 0)
-		t.Status = "COMPLETED"
-		return t
+// checkCanStart decides whether a new task may start on this device: it
+// returns the key the task will be billed to, or why it can't start (shown
+// to the user as last_error). Every task needs a key — the user's own, or
+// the server's for an owner (OWNER_USER_IDS) — and the monthly budget
+// protects the server's own key: once it's spent, new tasks on it are
+// refused (a running one is left alone). Users' own keys are theirs to
+// limit.
+func checkCanStart(ctx context.Context, deviceID string) (apiKey, string) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	key, err := resolveAPIKey(ctx, deviceID)
+	if err != nil {
+		srvLogf("device=%s: no usable OpenRouter key: %v", deviceID, err)
+		if errors.Is(err, errNoKey) {
+			return apiKey{}, errNoKey.Error()
+		}
+		return apiKey{}, "Couldn't look up your OpenRouter key. Try again."
 	}
-
-	idx := 0
-	if p.Revise {
-		idx = min(max(t.CurrentInstructionIndex, 0), len(t.InstructionList))
+	if spent := costs.serverMonthTotal(); key.serverKey && spent >= limits.MonthlyBudgetUSD {
+		srvLogf("device=%s: monthly budget reached ($%.4f of $%.2f)", deviceID, spent, limits.MonthlyBudgetUSD)
+		return apiKey{}, "Monthly AI budget reached"
 	}
-	completed := append([]string{}, t.InstructionList[:idx]...)
-	completedConfirm := make([]bool, idx)
-	copy(completedConfirm, t.NeedsConfirm[:min(idx, len(t.NeedsConfirm))])
-
-	t.InstructionList = append(completed, p.Instructions...)
-	t.NeedsConfirm = append(completedConfirm, p.NeedsConfirm...)
-	t.CurrentInstructionIndex = idx
-	t.Context = false // next ADVANCE generates executions, not a new plan
-	t.Reason = ""
-	t.InstrAttempts = 0
-	t.ExecutionList = make([]Execution, 0)
-	if t.ConfirmedIndex >= idx {
-		// The steps from idx on are new; an approval was for the old ones.
-		t.ConfirmedIndex = -1
-	}
-	srvLogf("device=%s: plan set (revise=%v), %d completed + %d new instructions: %v",
-		t.DeviceID, p.Revise, idx, len(p.Instructions), p.Instructions)
-
-	// An empty first plan means there's nothing to execute. Mark the task
-	// COMPLETED instead of leaving it RUNNING with 0 instructions —
-	// otherwise the next ADVANCE asks for instruction 0 of a 0-length list
-	// and fails ("index out of range") on a loop until the retries give up.
-	if len(t.InstructionList) == 0 {
-		t.Status = "COMPLETED"
-		srvLogf("device=%s: planner returned an empty plan, marking COMPLETED", t.DeviceID)
-	}
-	return t
+	return key, ""
 }
 
-// maxExecutorCallsPerStep caps executor calls on one instruction (an "act"
-// with instruction_done=false asks for another look); past it, replan.
-const maxExecutorCallsPerStep = 3
+// runAICall makes the AI call an ADVANCE asked for (with retries), then
+// feeds the outcome back through the state machine and broadcasts.
+func runAICall(taskID string, task Task, action Action) {
+	mutex.Lock()
+	key, haveKey := taskKeys[taskID]
+	mutex.Unlock()
 
-// applyExecResult applies the executor's verdict for the current step:
-//   - act:     hand the worker the actions; move to the next step only if
-//     the executor says they finish this one (otherwise the next ADVANCE
-//     gets another executor call on the same step)
-//   - skip:    the step is already done — next step, nothing to run (the
-//     worker sees an empty list and just sends a plain ADVANCE)
-//   - replan:  off-plan but achievable — revise the plan
-//   - blocked: can't be done as asked — ask the user
-//
-// image is the screenshot the executor judged, as a data URL, shown with
-// any question that results.
-//
-// Past the last step the call was the final check (E8): skip means the
-// whole task is done (COMPLETED); act runs its fix-up actions and checks
-// again (capped like any step); replan/blocked as usual.
-func applyExecResult(t Task, res ExecResult, image string) Task {
-	if t.CurrentInstructionIndex >= len(t.InstructionList) {
-		switch res.Verdict {
-		case verdictSkip:
-			t.Status = "COMPLETED"
-			t.ExecutionList = make([]Execution, 0)
-			srvLogf("device=%s: final check passed, task COMPLETED", t.DeviceID)
-			return t
-		case verdictAct:
-			t.ExecutionList = res.Actions
-			t.InstrAttempts++
-			srvLogf("device=%s: final check found the task unfinished, running %d fix-up actions: %+v",
-				t.DeviceID, len(res.Actions), res.Actions)
-			return t
+	if !haveKey {
+		// Only possible for a task created before the server knew about
+		// keys; look it up now rather than failing the task.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		key, _ = resolveAPIKey(ctx, taskID)
+		cancel()
+	}
+
+	res := AIResult{
+		Seq:      task.Seq,
+		Planning: task.Context,
+		Image:    screenshotDataURL(action.ScreenshotPayload),
+	}
+
+	var result any
+	start := time.Now()
+	const maxRetries = 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		callStart := time.Now()
+		var attemptCost float64
+		result, attemptCost, res.Err = sendMessage(task, action, key)
+		res.Cost += attemptCost
+		res.Attempts = attempt
+		callElapsed := time.Since(callStart)
+
+		if res.Err == nil {
+			srvLogf("device=%s: sendMessage attempt %d/%d succeeded in %s",
+				taskID, attempt, maxRetries, callElapsed)
+			break
+		}
+		srvLogf("device=%s: sendMessage attempt %d/%d FAILED after %s: %v",
+			taskID, attempt, maxRetries, callElapsed, res.Err)
+		if aiErrorMessage(res.Err) != "" {
+			break // a bad key or no credits won't fix itself on a retry
+		}
+		if attempt < maxRetries {
+			backoff := time.Duration(attempt) * time.Second
+			srvLogf("device=%s: retrying in %s", taskID, backoff)
+			time.Sleep(backoff) // 1s, 2s backoff
+		}
+	}
+	res.Took = time.Since(start)
+
+	if res.Err == nil {
+		switch v := result.(type) {
+		case PlanResult:
+			res.Plan = v
+		case ExecResult:
+			res.Exec = v
+		default:
+			res.Err = fmt.Errorf("unexpected AI result type %T", result)
 		}
 	}
 
-	switch res.Verdict {
-	case verdictAct:
-		t.ExecutionList = res.Actions
-		if res.InstructionDone {
-			t.CurrentInstructionIndex++
-			t.InstrAttempts = 0
-		} else {
-			t.InstrAttempts++
-		}
-		srvLogf("device=%s: executor act: %d actions for instruction %d/%d (done=%v): %+v",
-			t.DeviceID, len(res.Actions), t.CurrentInstructionIndex, len(t.InstructionList), res.InstructionDone, res.Actions)
-
-	case verdictSkip:
-		t.ExecutionList = make([]Execution, 0)
-		t.CurrentInstructionIndex++
-		t.InstrAttempts = 0
-		srvLogf("device=%s: executor skip: instruction already done on screen, now %d/%d",
-			t.DeviceID, t.CurrentInstructionIndex, len(t.InstructionList))
-
-	case verdictReplan:
-		srvLogf("device=%s: executor replan: %s", t.DeviceID, res.Reason)
-		t = requestReplan(t, res.Reason, image)
-
-	case verdictBlocked:
-		srvLogf("device=%s: executor blocked: %s", t.DeviceID, res.Reason)
-		t = askUser(t, "blocked", res.Reason, image)
+	mutex.Lock()
+	prev := taskHashTable[taskID]
+	next := onAIResult(prev, res)
+	if next.Status != prev.Status {
+		srvLogf("device=%s: status transition %s -> %s", taskID, prev.Status, next.Status)
 	}
-	return t
-}
+	taskHashTable[taskID] = next
+	clients := roomClients(taskID)
+	mutex.Unlock()
 
-// requestReplan asks the worker for fresh context so the planner can
-// revise the plan: RUNNING with an empty list and Context=true makes the
-// worker send a context ADVANCE (screenshot + filesystem), and the planner
-// then revises. Automatic revises are capped (MAX_AUTO_REPLANS): past the
-// cap the system is going in circles, so it asks the user instead.
-func requestReplan(t Task, reason, image string) Task {
-	if t.AutoReplans+1 > limits.MaxAutoReplans {
-		srvLogf("device=%s: %d automatic revises already, asking the user instead", t.DeviceID, t.AutoReplans)
-		return askUser(t, "blocked", fmt.Sprintf(
-			"I've tried to recover %d times and I'm still stuck: %s What should I do?",
-			t.AutoReplans, sentence(reason)), image)
+	if visibleChange(prev, next) {
+		// Not tied to any one connection's context: the connection that
+		// sent the ADVANCE may be gone by now.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		broadcastToTaskRoom(ctx, taskID, next, clients)
 	}
-	t.AutoReplans++
-	t.Context = true
-	t.ExecutionList = make([]Execution, 0)
-	t.Reason = reason
-	t.InstrAttempts = 0
-	t.Status = "RUNNING"
-	return t
 }
 
-// sentence trims s and makes sure it ends like a sentence.
-func sentence(s string) string {
-	s = strings.TrimSpace(s)
-	if s != "" && !strings.ContainsAny(s[len(s)-1:], ".!?") {
-		s += "."
+// roomClients copies a room's connections. Caller holds mutex.
+func roomClients(taskID string) []*websocket.Conn {
+	clients := make([]*websocket.Conn, 0, len(rooms[taskID]))
+	for client := range rooms[taskID] {
+		clients = append(clients, client)
 	}
-	return s
+	return clients
 }
 
-// askUser parks the task on a question for the user. The worker idles
-// (Status != RUNNING) until an answer or a cancel arrives. image is the
-// screen the question is about, as a data URL ("" if there's none).
-func askUser(t Task, kind, question, image string) Task {
-	t.Status = "NEEDS_INPUT"
-	t.Question = question
-	t.QuestionKind = kind
-	t.QuestionImage = image
-	t.ExecutionList = make([]Execution, 0)
-	return t
-}
-
-// needsConfirmation reports whether the current step is flagged as
-// irreversible and hasn't been approved yet.
-func needsConfirmation(t Task) bool {
-	idx := t.CurrentInstructionIndex
-	return !t.Context && idx >= 0 && idx < len(t.InstructionList) &&
-		idx < len(t.NeedsConfirm) && t.NeedsConfirm[idx] && t.ConfirmedIndex != idx
-}
-
-// approveAnswer is what the Approve button sends for a confirm question.
-const approveAnswer = "approve"
-
-// applyAnswer resumes a NEEDS_INPUT task with the user's answer:
-//   - confirm + "approve": the step is approved (ConfirmedIndex) and runs
-//     next — plain ADVANCE, executor call, no planner call
-//   - budget: any answer means "continue" — the per-task counters start a
-//     fresh window and the task carries on where it was, no planner call
-//     (Context keeps its value, so a plan that was about to be made still
-//     gets made)
-//   - blocked, or confirm with any other text ("do something else
-//     instead"): the answer is recorded and the planner
-//     revises the plan with it — Reason set, Context=true, so the worker
-//     sends a context ADVANCE. This doesn't count as an automatic revise.
-func applyAnswer(t Task, answer string, now time.Time) Task {
-	kind := t.QuestionKind
-	question := t.Question
-
-	t.Question = ""
-	t.QuestionKind = ""
-	t.QuestionImage = ""
-	t.ExecutionList = make([]Execution, 0)
-	t.Status = "RUNNING"
-
-	switch {
-	case kind == "confirm" && strings.EqualFold(answer, approveAnswer):
-		t.ConfirmedIndex = t.CurrentInstructionIndex
-		t.Context = false
-		srvLogf("device=%s: step %d approved by the user", t.DeviceID, t.CurrentInstructionIndex+1)
-
-	case kind == "budget":
-		t.AICalls = 0
-		t.PlannerCalls = 0
-		t.CostBase = t.CostUSD
-		t.StartedAt = now
-		srvLogf("device=%s: per-task caps reset after the user chose to continue", t.DeviceID)
-
-	default:
-		t.Answers = append(t.Answers, fmt.Sprintf("Q: %s / A: %s", question, answer))
-		t.Reason = "User answered: " + answer
-		t.Context = true
-		t.InstrAttempts = 0
-	}
-	return t
-}
-
-// screenshotDataURL renders a screenshot as a data: URL for question_image.
-func screenshotDataURL(shot Screenshot) string {
-	if len(shot.Data) == 0 {
-		return ""
-	}
-	return "data:image/" + shot.Format + ";base64," + base64.StdEncoding.EncodeToString(shot.Data)
-}
-
-// taskCapReached returns a user-facing explanation when the task has hit
-// one of the per-task caps (calls, planner calls, spend, running time), or
-// "" when it may make another AI call. The planner cap only applies when
-// the next call is a planner call (Context == true).
-func taskCapReached(t Task, now time.Time) string {
-	spent := t.CostUSD - t.CostBase
-	used := fmt.Sprintf("This task has used %d AI calls / $%.3f", t.AICalls, t.CostUSD)
-	switch {
-	case t.AICalls >= limits.MaxAICallsPerTask:
-		return used + fmt.Sprintf(" (limit %d calls). Continue?", limits.MaxAICallsPerTask)
-	case t.Context && t.PlannerCalls >= limits.MaxPlannerCallsPerTask:
-		return used + fmt.Sprintf(" and planned %d times (limit %d). Continue?", t.PlannerCalls, limits.MaxPlannerCallsPerTask)
-	case spent >= limits.MaxTaskCostUSD:
-		return used + fmt.Sprintf(" (limit $%.2f). Continue?", limits.MaxTaskCostUSD)
-	case !t.StartedAt.IsZero() && now.Sub(t.StartedAt) >= limits.MaxTaskDuration:
-		return used + fmt.Sprintf(" and has run for %s (limit %s). Continue?",
-			now.Sub(t.StartedAt).Round(time.Second), limits.MaxTaskDuration)
-	}
-	return ""
-}
-
-// resetTask returns a fresh, empty task for the given device — the same
-// shape CANCEL_TASK produces. Used both for explicit cancellation and for
-// giving up on a task after repeated ADVANCE failures: the room's entry in
-// taskHashTable stays put (rooms are never recreated), it just goes back
-// to a clean NONE state.
-func resetTask(deviceID string) Task {
-	return Task{
-		DeviceID:                deviceID,
-		Description:             "",
-		Status:                  "NONE",
-		CurrentInstructionIndex: 0,
-		InstructionList:         make([]string, 0),
-		ExecutionList:           make([]Execution, 0),
-		Context:                 false,
-		Answers:                 make([]string, 0),
-		ConfirmedIndex:          -1,
-		NeedsConfirm:            make([]bool, 0),
-	}
+// visibleChange reports whether a transition changed anything clients can
+// see (the broadcast Task); server-only bookkeeping (json:"-") doesn't
+// warrant a broadcast.
+func visibleChange(a, b Task) bool {
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA != nil || errB != nil || !bytes.Equal(ja, jb)
 }
 
 func sendTaskState(ctx context.Context, conn *websocket.Conn, task Task) {
