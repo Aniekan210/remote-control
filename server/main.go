@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -215,7 +216,7 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 
 		// A one-off error is shown until the next accepted client action.
 		switch action.Type {
-		case "CREATE_TASK", "PAUSE_TASK", "RESUME_TASK", "CANCEL_TASK":
+		case "CREATE_TASK", "PAUSE_TASK", "RESUME_TASK", "CANCEL_TASK", "ANSWER":
 			task.LastError = ""
 		}
 
@@ -285,7 +286,8 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			// far as recovery goes: revise it, no executor call.
 			if action.Error != "" {
 				srvLogf("device=%s: worker reported an error, replanning: %s", taskID, action.Error)
-				task = requestReplan(task, "The computer couldn't carry out the last step: "+action.Error)
+				task = requestReplan(task, "The computer couldn't carry out the last step: "+action.Error,
+					screenshotDataURL(action.ScreenshotPayload))
 				break
 			}
 
@@ -313,17 +315,11 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 
 			// Per-task caps: a runaway task (looping, or just long) stops
 			// spending before the next call. Hitting a cap doesn't fail the
-			// task — it pauses it with an explanation, and resuming grants
+			// task — it becomes a budget question, and answering it grants
 			// a fresh window of calls/spend/time.
 			if reason := taskCapReached(task, time.Now()); reason != "" {
-				task.Status = "PAUSED"
-				task.CapHit = true
-				task.LastError = reason
-				// The worker already ran this list (that's what this ADVANCE
-				// reports), so clear it: on resume the worker then just sends
-				// a fresh ADVANCE instead of replaying the last batch.
-				task.ExecutionList = make([]Execution, 0)
-				srvLogf("device=%s: per-task cap reached, pausing: %s", taskID, reason)
+				srvLogf("device=%s: per-task cap reached, asking the user: %s", taskID, reason)
+				task = askUser(task, "budget", reason, screenshotDataURL(action.ScreenshotPayload))
 				break
 			}
 
@@ -333,7 +329,8 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				srvLogf("device=%s: instruction %d not done after %d executor calls, replanning",
 					taskID, task.CurrentInstructionIndex, task.InstrAttempts)
 				task = requestReplan(task, fmt.Sprintf("Step %d (%q) still wasn't done after %d attempts.",
-					task.CurrentInstructionIndex+1, task.InstructionList[task.CurrentInstructionIndex], task.InstrAttempts))
+					task.CurrentInstructionIndex+1, task.InstructionList[task.CurrentInstructionIndex], task.InstrAttempts),
+					screenshotDataURL(action.ScreenshotPayload))
 				break
 			}
 
@@ -446,7 +443,7 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 					task = resetTask(task.DeviceID)
 					break
 				}
-				task = applyExecResult(task, res)
+				task = applyExecResult(task, res, screenshotDataURL(action.ScreenshotPayload))
 			}
 
 		case "PAUSE_TASK":
@@ -454,17 +451,16 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			srvLogf("device=%s: PAUSE_TASK", taskID)
 		case "RESUME_TASK":
 			task.Status = "RUNNING"
-			if task.CapHit {
-				// Resuming after a cap means "yes, keep going": start a fresh
-				// window of calls/spend/time for this task.
-				task.CapHit = false
-				task.AICalls = 0
-				task.PlannerCalls = 0
-				task.CostBase = task.CostUSD
-				task.StartedAt = time.Now()
-				srvLogf("device=%s: per-task caps reset after the user chose to continue", taskID)
-			}
 			srvLogf("device=%s: RESUME_TASK", taskID)
+		case "ANSWER":
+			if task.Status != "NEEDS_INPUT" {
+				srvLogf("device=%s: ignoring ANSWER, task is %s (not waiting on a question)", taskID, task.Status)
+				mutex.Unlock()
+				continue
+			}
+			answer := strings.TrimSpace(action.Description)
+			srvLogf("device=%s: ANSWER to %s question %q: %q", taskID, task.QuestionKind, task.Question, answer)
+			task = applyAnswer(task, answer, time.Now())
 		case "CANCEL_TASK":
 			task = resetTask(task.DeviceID)
 			srvLogf("device=%s: CANCEL_TASK, task reset", taskID)
@@ -506,7 +502,10 @@ const maxExecutorCallsPerStep = 3
 //     worker sees an empty list and just sends a plain ADVANCE)
 //   - replan:  off-plan but achievable — revise the plan
 //   - blocked: can't be done as asked — ask the user
-func applyExecResult(t Task, res ExecResult) Task {
+//
+// image is the screenshot the executor judged, as a data URL, shown with
+// any question that results.
+func applyExecResult(t Task, res ExecResult, image string) Task {
 	switch res.Verdict {
 	case verdictAct:
 		t.ExecutionList = res.Actions
@@ -528,11 +527,11 @@ func applyExecResult(t Task, res ExecResult) Task {
 
 	case verdictReplan:
 		srvLogf("device=%s: executor replan: %s", t.DeviceID, res.Reason)
-		t = requestReplan(t, res.Reason)
+		t = requestReplan(t, res.Reason, image)
 
 	case verdictBlocked:
 		srvLogf("device=%s: executor blocked: %s", t.DeviceID, res.Reason)
-		t = askUser(t, "blocked", res.Reason)
+		t = askUser(t, "blocked", res.Reason, image)
 	}
 	return t
 }
@@ -542,12 +541,12 @@ func applyExecResult(t Task, res ExecResult) Task {
 // worker send a context ADVANCE (screenshot + filesystem), and the planner
 // then revises. Automatic revises are capped (MAX_AUTO_REPLANS): past the
 // cap the system is going in circles, so it asks the user instead.
-func requestReplan(t Task, reason string) Task {
+func requestReplan(t Task, reason, image string) Task {
 	if t.AutoReplans+1 > limits.MaxAutoReplans {
 		srvLogf("device=%s: %d automatic revises already, asking the user instead", t.DeviceID, t.AutoReplans)
 		return askUser(t, "blocked", fmt.Sprintf(
 			"I've tried to recover %d times and I'm still stuck: %s What should I do?",
-			t.AutoReplans, sentence(reason)))
+			t.AutoReplans, sentence(reason)), image)
 	}
 	t.AutoReplans++
 	t.Context = true
@@ -568,13 +567,58 @@ func sentence(s string) string {
 }
 
 // askUser parks the task on a question for the user. The worker idles
-// (Status != RUNNING) until an answer or a cancel arrives.
-func askUser(t Task, kind, question string) Task {
+// (Status != RUNNING) until an answer or a cancel arrives. image is the
+// screen the question is about, as a data URL ("" if there's none).
+func askUser(t Task, kind, question, image string) Task {
 	t.Status = "NEEDS_INPUT"
 	t.Question = question
 	t.QuestionKind = kind
+	t.QuestionImage = image
 	t.ExecutionList = make([]Execution, 0)
 	return t
+}
+
+// applyAnswer resumes a NEEDS_INPUT task with the user's answer:
+//   - budget: any answer means "continue" — the per-task counters start a
+//     fresh window and the task carries on where it was, no planner call
+//     (Context keeps its value, so a plan that was about to be made still
+//     gets made)
+//   - blocked (and anything else): the answer is recorded and the planner
+//     revises the plan with it — Reason set, Context=true, so the worker
+//     sends a context ADVANCE. This doesn't count as an automatic revise.
+func applyAnswer(t Task, answer string, now time.Time) Task {
+	kind := t.QuestionKind
+	question := t.Question
+
+	t.Question = ""
+	t.QuestionKind = ""
+	t.QuestionImage = ""
+	t.ExecutionList = make([]Execution, 0)
+	t.Status = "RUNNING"
+
+	switch kind {
+	case "budget":
+		t.AICalls = 0
+		t.PlannerCalls = 0
+		t.CostBase = t.CostUSD
+		t.StartedAt = now
+		srvLogf("device=%s: per-task caps reset after the user chose to continue", t.DeviceID)
+
+	default:
+		t.Answers = append(t.Answers, fmt.Sprintf("Q: %s / A: %s", question, answer))
+		t.Reason = "User answered: " + answer
+		t.Context = true
+		t.InstrAttempts = 0
+	}
+	return t
+}
+
+// screenshotDataURL renders a screenshot as a data: URL for question_image.
+func screenshotDataURL(shot Screenshot) string {
+	if len(shot.Data) == 0 {
+		return ""
+	}
+	return "data:image/" + shot.Format + ";base64," + base64.StdEncoding.EncodeToString(shot.Data)
 }
 
 // taskCapReached returns a user-facing explanation when the task has hit

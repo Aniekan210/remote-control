@@ -39,7 +39,6 @@ type Task struct {
 	PlannerCalls int       `json:"-"` // planning calls, same window
 	CostBase     float64   `json:"-"` // CostUSD at the start of the current window
 	StartedAt    time.Time `json:"-"` // start of the current window, for MAX_TASK_DURATION
-	CapHit       bool      `json:"-"` // paused because a per-task cap was reached
 
 	InstrAttempts int `json:"-"` // executor calls on the current instruction (capped, then replan)
 }
