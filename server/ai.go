@@ -186,14 +186,15 @@ var executionActionSchema = map[string]any{
 	"properties": map[string]any{
 		"type": map[string]any{
 			"type": "string",
-			"enum": []string{"MOUSE_MOVEMENT", "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT"},
+			"enum": []string{"MOUSE_MOVEMENT", "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT", "WAIT"},
 		},
 		"mouse_pos_x": map[string]any{"type": "integer"},
 		"mouse_pos_y": map[string]any{"type": "integer"},
 		"key_string":  map[string]any{"type": "string"},
 		"mouse_hold":  map[string]any{"type": "boolean"},
+		"ms":          map[string]any{"type": "integer"},
 	},
-	"required":             []string{"type", "mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold"},
+	"required":             []string{"type", "mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold", "ms"},
 	"additionalProperties": false,
 }
 
@@ -544,7 +545,7 @@ func parseExecResult(response string) (ExecResult, error) {
 		}
 		for i, e := range res.Actions {
 			switch e.Type {
-			case "MOUSE_MOVEMENT", "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT":
+			case "MOUSE_MOVEMENT", "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT", "WAIT":
 				// valid
 			default:
 				return ExecResult{}, fmt.Errorf("execution %d has invalid/empty type %q — the model almost certainly used the wrong JSON field names (expected type/mouse_pos_x/mouse_pos_y/key_string/mouse_hold)", i, e.Type)

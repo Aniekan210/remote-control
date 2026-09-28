@@ -11,12 +11,28 @@ import (
 
 // interActionDelay is a short pause left after each physical action within
 // one instruction's execution list. Actions in a single list run back to
-// back with no screenshot between them, so the UI needs a beat to catch up
-// — e.g. after {WIN} the Start menu must actually open before the next
-// action types into it, otherwise the keystrokes are dropped. This is well
-// below the per-step AI round-trip (seconds), so it doesn't make the agent
-// feel slow; raise it if a machine is sluggish, lower it for snappier runs.
+// back with no screenshot between them, so the UI needs a beat to catch up.
+// This is well below the per-step AI round-trip (seconds), so it doesn't
+// make the agent feel slow; raise it if a machine is sluggish, lower it for
+// snappier runs.
+//
+// After an action that usually opens something — {WIN}, {ENTER}, a click
+// — a fixed beat isn't enough (the Start menu must actually be open before
+// the next action types into it, or the keystrokes are dropped), so the
+// executor waits for the screen to settle instead (see settlesAfter),
+// bounded by these (env-overridable, milliseconds):
+//
+//	ACTION_SETTLE_INITIAL_MS, ACTION_SETTLE_POLL_MS, ACTION_SETTLE_MAX_MS
 const interActionDelay = 120 * time.Millisecond
+
+var (
+	actionSettleInitial = envDuration("ACTION_SETTLE_INITIAL_MS", 150*time.Millisecond)
+	actionSettlePoll    = envDuration("ACTION_SETTLE_POLL_MS", 150*time.Millisecond)
+	actionSettleMax     = envDuration("ACTION_SETTLE_MAX_MS", 2500*time.Millisecond)
+)
+
+// maxWaitAction caps a WAIT the model asks for.
+const maxWaitAction = 10 * time.Second
 
 // Screen-settle timings for the ADVANCE screenshot. Every screenshot that
 // drives the next step waits for the screen to stop changing first, so the
@@ -137,7 +153,7 @@ func toScreenExecutions(execs []Execution, frame shotFrame) ([]Execution, error)
 				return nil, fmt.Errorf("action %d: %w", i+1, err)
 			}
 			e.MousePosX, e.MousePosY = x, y
-		case "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT":
+		case "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT", "WAIT":
 		default:
 			return nil, fmt.Errorf("action %d: unknown action type %q", i+1, e.Type)
 		}
@@ -221,7 +237,7 @@ func executeList(execs []Execution, overlay chan<- OverlayState, base OverlaySta
 	leftHeld := false
 	rightHeld := false
 
-	for _, e := range execs {
+	for i, e := range execs {
 		// If the human has taken over the mouse, block here until it's clear
 		// to proceed — so the worker never fights the person for the cursor.
 		takeover.Gate()
@@ -264,13 +280,26 @@ func executeList(execs []Execution, overlay chan<- OverlayState, base OverlaySta
 		case "KEYBOARD_INPUT":
 			TypeText(e.KeyString)
 
+		case "WAIT":
+			d := time.Duration(e.Ms) * time.Millisecond
+			d = min(max(d, 0), maxWaitAction)
+			time.Sleep(d)
+
 		default:
 			// toScreenExecutions rejects these before anything runs.
 			log.Printf("executor: unknown execution type %q", e.Type)
 		}
 
-		// Let the UI settle before the next action in this list.
-		time.Sleep(interActionDelay)
+		// Let the UI settle before the next action in this list. The last
+		// action needs nothing here: the ADVANCE screenshot waits for the
+		// screen to settle anyway.
+		switch {
+		case i == len(execs)-1:
+		case settlesAfter(e):
+			WaitForStableScreen(actionSettleInitial, actionSettlePoll, actionSettleMax)
+		default:
+			time.Sleep(interActionDelay)
+		}
 	}
 
 	// Safety net: never leave a button physically stuck down if a list
@@ -281,6 +310,22 @@ func executeList(execs []Execution, overlay chan<- OverlayState, base OverlaySta
 	if rightHeld {
 		RightUp()
 	}
+}
+
+// settlesAfter reports whether an action usually opens or changes
+// something on screen ({WIN}, {ENTER}, a click or a drag's release), so the
+// next action in the list should wait for the screen to settle rather
+// than a fixed beat.
+func settlesAfter(e Execution) bool {
+	switch e.Type {
+	case "LEFT_CLICK", "RIGHT_CLICK":
+		return !e.MouseHold
+	case "KEYBOARD_INPUT":
+		k := strings.ToUpper(e.KeyString)
+		return strings.Contains(k, "{WIN}") || strings.Contains(k, "{ENTER}") || strings.Contains(k, "{RETURN}") ||
+			strings.HasSuffix(e.KeyString, "\n")
+	}
+	return false
 }
 
 // actionText renders one physical action as a short human-readable line for
@@ -309,6 +354,8 @@ func actionText(e Execution) string {
 			s = s[:24] + "…"
 		}
 		return fmt.Sprintf("Typing “%s”", s)
+	case "WAIT":
+		return fmt.Sprintf("Waiting %d ms", e.Ms)
 	default:
 		return ""
 	}

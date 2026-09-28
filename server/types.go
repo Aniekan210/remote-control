@@ -45,11 +45,12 @@ type Task struct {
 }
 
 type Execution struct {
-	Type      string `json:"type"`        // RIGHT_CLICK / LEFT_CLICK / KEYBOARD_INPUT / MOUSE_MOVEMENT
+	Type      string `json:"type"`        // RIGHT_CLICK / LEFT_CLICK / KEYBOARD_INPUT / MOUSE_MOVEMENT / WAIT
 	KeyString string `json:"key_string"`  // the string that the keyboard is to input
 	MousePosX int    `json:"mouse_pos_x"` // the x position the mouse is to move to
 	MousePosY int    `json:"mouse_pos_y"` // the y position the mouse is to move to
 	MouseHold bool   `json:"mouse_hold"`  // true to hold current click and true if you want to move the mouse with the click, false next execution to release
+	Ms        int    `json:"ms"`          // WAIT only: how long to wait, in milliseconds
 }
 
 type Action struct {

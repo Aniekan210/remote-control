@@ -200,6 +200,27 @@ func changedFraction(a, b []byte) float64 {
 // `maxWait` elapses — whichever comes first. On timeout it returns the
 // most recent frame (best effort) rather than failing.
 func CaptureStableScreen(initial, poll, maxWait time.Duration, fullRes bool) (Screenshot, error) {
+	img, err := waitForStableFrame(initial, poll, maxWait)
+	if err != nil {
+		return Screenshot{}, err
+	}
+	return encodeScreenshot(img, fullRes)
+}
+
+// WaitForStableScreen blocks until the screen stops changing (or maxWait
+// passes), without capturing anything for the AI. Used between actions in
+// one list, e.g. after {WIN} so the Start menu is open before typing.
+func WaitForStableScreen(initial, poll, maxWait time.Duration) {
+	if _, err := waitForStableFrame(initial, poll, maxWait); err != nil {
+		// Can't watch the screen: fall back to just waiting a moment.
+		time.Sleep(initial + poll)
+	}
+}
+
+// waitForStableFrame is the settle loop shared by CaptureStableScreen and
+// WaitForStableScreen: it returns the first frame that is near-identical
+// to the one before it, or the latest frame once maxWait has passed.
+func waitForStableFrame(initial, poll, maxWait time.Duration) (*image.RGBA, error) {
 	start := time.Now()
 	if initial > 0 {
 		time.Sleep(initial)
@@ -207,7 +228,7 @@ func CaptureStableScreen(initial, poll, maxWait time.Duration, fullRes bool) (Sc
 
 	img, err := captureImage()
 	if err != nil {
-		return Screenshot{}, err
+		return nil, err
 	}
 	prev := fingerprint(img)
 
@@ -224,10 +245,10 @@ func CaptureStableScreen(initial, poll, maxWait time.Duration, fullRes bool) (Sc
 		prev = nfp
 		if frac < fpStableFraction {
 			log.Printf("screenshot: screen settled after %v", time.Since(start).Round(time.Millisecond))
-			return encodeScreenshot(img, fullRes)
+			return img, nil
 		}
 	}
 
-	log.Printf("screenshot: screen did NOT settle within %v (still changing) — capturing anyway", maxWait)
-	return encodeScreenshot(img, fullRes)
+	log.Printf("screenshot: screen did NOT settle within %v (still changing) — going ahead anyway", maxWait)
+	return img, nil
 }

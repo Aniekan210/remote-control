@@ -34,11 +34,12 @@ type Task struct {
 }
 
 type Execution struct {
-	Type      string `json:"type"` // RIGHT_CLICK / LEFT_CLICK / KEYBOARD_INPUT / MOUSE_MOVEMENT
+	Type      string `json:"type"` // RIGHT_CLICK / LEFT_CLICK / KEYBOARD_INPUT / MOUSE_MOVEMENT / WAIT
 	KeyString string `json:"key_string"`
 	MousePosX int    `json:"mouse_pos_x"`
 	MousePosY int    `json:"mouse_pos_y"`
 	MouseHold bool   `json:"mouse_hold"`
+	Ms        int    `json:"ms"` // WAIT only: milliseconds
 }
 
 type Action struct {

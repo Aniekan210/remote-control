@@ -254,17 +254,18 @@ Return ONLY a JSON object of exactly this shape:
  "instruction_done": true | false,
  "actions": [ <action>, <action>, ... ]}
 
-Each <action> uses EXACTLY these five field names — no others:
+Each <action> uses EXACTLY these six field names — no others:
 
-  "type"         one of: "MOUSE_MOVEMENT" | "LEFT_CLICK" | "RIGHT_CLICK" | "KEYBOARD_INPUT"
+  "type"         one of: "MOUSE_MOVEMENT" | "LEFT_CLICK" | "RIGHT_CLICK" | "KEYBOARD_INPUT" | "WAIT"
   "mouse_pos_x"  INTEGER ONLY — exactly one number, never an array, never a list, never [x,y]
   "mouse_pos_y"  INTEGER ONLY — exactly one number, never an array, never a list, never [x,y]
   "key_string"   string   — text/keys to send (use "" unless type is KEYBOARD_INPUT)
   "mouse_hold"   boolean  — true ONLY to hold the button down during a drag
+  "ms"           integer  — WAIT only: milliseconds to wait (use 0 otherwise)
 
 mouse_pos_x and mouse_pos_y are SEPARATE INTEGER FIELDS — never [x,y].
 Do NOT use "action", "x", "y", or "text". The keys are exactly "type",
-"mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold".
+"mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold", "ms".
 
 ────────────────────────────────────────
 MOUSE RULES
@@ -281,6 +282,15 @@ MOUSE RULES
   after it would be guesses. Typing and keys after the click are fine. If
   the step needs another click after that, set "instruction_done" to false
   — you'll get a fresh screenshot and another turn.
+
+────────────────────────────────────────
+WAITING
+────────────────────────────────────────
+- The computer already waits for the screen to settle after {WIN},
+  {ENTER} and clicks. Add a WAIT only when something slow must finish
+  before your next action in the same list (e.g. an app launching):
+  {"type":"WAIT","ms":1500,"mouse_pos_x":0,"mouse_pos_y":0,"key_string":"","mouse_hold":false}
+  Keep it under 5000 ms.
 
 ────────────────────────────────────────
 KEYBOARD RULES
