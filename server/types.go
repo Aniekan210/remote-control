@@ -9,7 +9,8 @@ type StateUpdate struct {
 
 // RoomRequest represents the payload for creating a new room/item via HTTP
 type RoomRequest struct {
-	DeviceID string `json:"device_id"`
+	DeviceID     string `json:"device_id"`
+	WorkerSecret string `json:"worker_secret"` // the worker's per-install secret; proves ownership of the room on /ws
 }
 
 type Task struct {

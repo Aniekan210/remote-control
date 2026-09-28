@@ -47,6 +47,21 @@ func handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 	mutex.Lock()
 
 	if _, exists := taskHashTable[req.DeviceID]; exists {
+		// The worker re-registers on every boot and after a 404, so an
+		// existing room is normal — as long as it's the same worker. A
+		// different secret means someone else is claiming this device ID.
+		// A room registered without a secret (a pre-auth worker) is
+		// upgraded to the first secret that shows up.
+		existing := roomSecrets[req.DeviceID]
+		switch {
+		case existing == "" && req.WorkerSecret != "":
+			roomSecrets[req.DeviceID] = req.WorkerSecret
+		case existing != "" && !secretsEqual(existing, req.WorkerSecret):
+			mutex.Unlock()
+			srvLogf("POST /rooms rejected: room for device=%s is owned by a different worker secret", req.DeviceID)
+			http.Error(w, "Room is owned by another worker", http.StatusForbidden)
+			return
+		}
 		mutex.Unlock()
 		srvLogf("POST /rooms: room already exists for device=%s", req.DeviceID)
 		http.Error(w, "Room already exists", http.StatusConflict)
@@ -54,8 +69,13 @@ func handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	taskHashTable[req.DeviceID] = resetTask(req.DeviceID)
+	roomSecrets[req.DeviceID] = req.WorkerSecret
 
 	mutex.Unlock()
+
+	if req.WorkerSecret == "" {
+		srvLogf("WARNING: device=%s registered without a worker secret (old worker build) — it can only connect while CONTROL_SHARED_SECRET is unset", req.DeviceID)
+	}
 
 	srvLogf("POST /rooms: created room for device=%s", req.DeviceID)
 
@@ -89,6 +109,17 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Who is this? The worker proves the room's secret; a web client
+	// proves a fresh token minted by the Next.js app. Anyone else is
+	// turned away before the upgrade.
+	role, ok := authenticateConnection(r, taskID, roomSecrets[taskID])
+	if !ok {
+		mutex.Unlock()
+		srvLogf("WS connection rejected: unauthorized for device=%s (remote=%s)", taskID, r.RemoteAddr)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	// Register the client
 	if rooms[taskID] == nil {
 		rooms[taskID] = make(map[*websocket.Conn]bool)
@@ -119,8 +150,8 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 
 	mutex.Unlock()
 
-	srvLogf("WS connected: device=%s remote=%s clientsInRoom=%d currentStatus=%s",
-		taskID, r.RemoteAddr, clientCount, currentTask.Status)
+	srvLogf("WS connected: device=%s remote=%s role=%s clientsInRoom=%d currentStatus=%s",
+		taskID, r.RemoteAddr, role, clientCount, currentTask.Status)
 
 	defer conn.Close(websocket.StatusInternalError, "connection closing")
 
@@ -155,6 +186,11 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 		}
 
 		srvLogf("device=%s: received action type=%s", taskID, action.Type)
+
+		if !roleMayAct(role, action.Type) {
+			srvLogf("device=%s: ignoring %s from a %s connection (not allowed for that role)", taskID, action.Type, role)
+			continue
+		}
 
 		mutex.Lock()
 
@@ -520,6 +556,10 @@ func main() {
 	}
 	costs = loadCostTracker(costStateFile)
 
+	if sharedSecret() == "" {
+		srvLogf("WARNING: CONTROL_SHARED_SECRET is not set — /ws connections are NOT authenticated. Anyone who knows a device ID can drive that computer. Set it (same value in the Next.js app) to turn auth on.")
+	}
+
 	// HTTP REST endpoint
 	http.HandleFunc("/rooms", handleCreateRoom)
 
@@ -541,6 +581,10 @@ var (
 
 	// Tracks connected clients grouped by Task ID
 	rooms = make(map[string]map[*websocket.Conn]bool)
+
+	// The secret each room's worker registered with (POST /rooms). Kept out
+	// of Task, which is broadcast to every client in full.
+	roomSecrets = map[string]string{}
 
 	mutex sync.Mutex
 )

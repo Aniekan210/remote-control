@@ -98,6 +98,11 @@ func main() {
 		log.Fatalf("failed to get/create device id: %v", err)
 	}
 
+	workerSecret, err := GetOrCreateWorkerSecret()
+	if err != nil {
+		log.Fatalf("failed to get/create worker secret: %v", err)
+	}
+
 	fmt.Println("=====================================")
 	fmt.Println(" RemoteWorker starting")
 	fmt.Println(" Device ID:", deviceID)
@@ -106,7 +111,7 @@ func main() {
 	// Register ourselves with the server. The server's room table is
 	// in-memory only, so this runs on every boot, not just the first —
 	// a 409 (already registered) is treated as success.
-	if err := RegisterRoom(serverAddr, deviceID); err != nil {
+	if err := RegisterRoom(serverAddr, deviceID, workerSecret); err != nil {
 		log.Printf("warning: failed to register room after retries: %v", err)
 		log.Printf("will still try to connect — the room may already exist on the server")
 	}
@@ -136,7 +141,7 @@ func main() {
 	fsStore := NewSnapshotStore()
 
 	go RunFSWatcher(ctx, defaultWatchRoots(), fsStore)
-	go RunWSClient(ctx, serverAddr, deviceID, wsURL, state, changes)
+	go RunWSClient(ctx, serverAddr, deviceID, workerSecret, wsURL, state, changes)
 	go RunExecutor(state, deviceID, changes, overlayUpdates, fsStore)
 
 	// The overlay is the riskiest code in this project — raw Win32 window
