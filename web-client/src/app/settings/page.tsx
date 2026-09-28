@@ -3,7 +3,8 @@ import { requireSession } from "@/lib/session";
 import { getDevice } from "@/lib/device";
 import { extractDeviceId } from "@/lib/device-id";
 import { IconBack } from "@/components/icons";
-import { DeviceCard, DeviceForm, SignOutButton } from "./client";
+import { getKeyInfo } from "@/lib/openrouter-key";
+import { ApiKeyCard, DeviceCard, DeviceForm, SignOutButton } from "./client";
 
 export const dynamic = "force-dynamic";
 
@@ -17,6 +18,10 @@ export default async function SettingsPage({
     rawIncoming ? `/settings?device=${encodeURIComponent(rawIncoming)}` : "/settings",
   );
   const device = await getDevice(session.user.id);
+  const apiKey = await getKeyInfo(session.user.id).catch((err) => {
+    console.error("getKeyInfo", err);
+    return null;
+  });
   const { user } = session;
 
   // Scanning the worker's QR with the phone's normal camera app can open
@@ -51,6 +56,13 @@ export default async function SettingsPage({
           ) : (
             <DeviceForm initialDeviceId={incoming ?? ""} />
           )}
+        </Section>
+
+        <Section
+          title="OpenRouter API key"
+          hint="Your tasks run on your own OpenRouter key. It's stored encrypted and never shown again."
+        >
+          <ApiKeyCard last4={apiKey?.last4 ?? null} updatedAt={apiKey?.updatedAt ?? null} />
         </Section>
 
         <Section title="Account">
