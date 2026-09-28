@@ -51,6 +51,9 @@ type Action struct {
 	// out here (screenshot failed twice, coordinates off the screen, an
 	// unknown action type). The server treats it as a replan.
 	Error string `json:"error,omitempty"`
+	// Seq, on ADVANCE, is the Task.Seq this ADVANCE answers. The server
+	// ignores ADVANCEs for a state it has already moved past.
+	Seq int `json:"seq,omitempty"`
 }
 
 type FileEntry struct {

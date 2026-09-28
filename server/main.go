@@ -213,6 +213,13 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 
 		task := taskHashTable[taskID]
 		prevStatus := task.Status
+		prevSeq := task.Seq
+		// bump marks a transition the worker must act on (E9): Seq goes up
+		// by one, and any ADVANCE or AI result for the old Seq is stale.
+		// Pause/resume don't bump: the worker's state is the same after a
+		// resume, and it re-sends its ADVANCE for that Seq (see the worker's
+		// RunExecutor).
+		bump := false
 
 		// A one-off error is shown until the next accepted client action.
 		switch action.Type {
@@ -273,12 +280,34 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				NeedsConfirm:            make([]bool, 0),
 				StartedAt:               time.Now(),
 			}
+			bump = true
 			srvLogf("device=%s: CREATE_TASK description=%q (full state reset)", taskID, action.Description)
 
 		case "ADVANCE":
-			srvLogf("device=%s: ADVANCE received, context=%v currentInstrIdx=%d/%d screenshotBytes=%d fsEntries=%d",
-				taskID, task.Context, task.CurrentInstructionIndex, len(task.InstructionList),
+			srvLogf("device=%s: ADVANCE received, seq=%d (task seq=%d) context=%v currentInstrIdx=%d/%d screenshotBytes=%d fsEntries=%d",
+				taskID, action.Seq, task.Seq, task.Context, task.CurrentInstructionIndex, len(task.InstructionList),
 				len(action.ScreenshotPayload.Data), len(action.FileSystemPayload))
+
+			// Only an ADVANCE for the current state counts, once (E9).
+			// Without this, two in-flight ADVANCEs (e.g. around a
+			// reconnect) both advanced the task and skipped a step. Seq 0
+			// is a worker from before sequence numbers: accepted, but still
+			// de-duplicated by InFlight.
+			switch {
+			case task.Status != "RUNNING":
+				srvLogf("device=%s: ignoring ADVANCE, task is %s", taskID, task.Status)
+				mutex.Unlock()
+				continue
+			case action.Seq != 0 && action.Seq != task.Seq:
+				srvLogf("device=%s: ignoring stale ADVANCE (seq %d, task is at %d)", taskID, action.Seq, task.Seq)
+				mutex.Unlock()
+				continue
+			case task.InFlight:
+				srvLogf("device=%s: ignoring duplicate ADVANCE, an AI call for seq %d is already running", taskID, task.Seq)
+				mutex.Unlock()
+				continue
+			}
+			bump = true // every outcome below is new work for the worker
 
 			// The worker couldn't do what it was told (the screenshot
 			// failed twice, coordinates off the screen, an action type it
@@ -336,7 +365,11 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 
 			// Release the lock before the network call so a slow request
 			// (or our retries) don't block every other room's messages
-			// from being processed while we wait on the AI.
+			// from being processed while we wait on the AI. InFlight is
+			// stored first, so a duplicate ADVANCE meanwhile is ignored.
+			task.InFlight = true
+			taskHashTable[taskID] = task
+			callSeq := task.Seq
 			mutex.Unlock()
 
 			if !haveKey {
@@ -376,19 +409,26 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 
 			mutex.Lock()
 
-			// Re-read current state: another message (PAUSE/CANCEL/another
-			// ADVANCE from a different client in the room) may have landed
-			// while we were waiting on the network call.
+			// Re-read current state: another message (PAUSE/CANCEL/ANSWER/
+			// a new task) may have landed while we were waiting on the
+			// network call.
 			task = taskHashTable[taskID]
 
-			// Charge the call to the task, unless it was cancelled while the
-			// call was in flight (a reset task starts again from $0).
-			if task.Status != "NONE" {
-				task.CostUSD += callCost
-				task.AICalls++
-				if wasPlanning {
-					task.PlannerCalls++
-				}
+			if task.Seq != callSeq {
+				// Cancelled, replaced, or otherwise moved on while the call
+				// was in flight: the result is for a state that no longer
+				// exists. Drop it (the month total already has its cost).
+				srvLogf("device=%s: dropping stale AI result for seq %d, task is now at seq %d (%s)",
+					taskID, callSeq, task.Seq, task.Status)
+				mutex.Unlock()
+				continue
+			}
+
+			task.InFlight = false
+			task.CostUSD += callCost
+			task.AICalls++
+			if wasPlanning {
+				task.PlannerCalls++
 			}
 
 			switch {
@@ -398,12 +438,17 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				srvLogf("device=%s: giving up after %d attempts, resetting task to NONE: %v",
 					taskID, maxRetries, sendErr)
 				task = resetTask(task.DeviceID)
+				task.LastError = "The AI calls kept failing, so the task was stopped. Try again."
 
 			case task.Status != "RUNNING":
-				// Task was paused/cancelled/reset while this request was
-				// in flight — drop the now-stale result.
-				srvLogf("device=%s: dropping stale ADVANCE result, status changed to %q while AI call was in flight",
+				// Paused while the call was in flight (the person took
+				// over the mouse, or paused from the phone): the screen may
+				// no longer be what the AI saw, so drop the result. The
+				// worker re-sends its ADVANCE for this Seq on resume and a
+				// fresh call is made then.
+				srvLogf("device=%s: dropping AI result, task was %s while the call was in flight",
 					taskID, task.Status)
+				bump = false
 
 			case task.Context:
 				// Planning call: a first plan, or a revision of the rest.
@@ -430,9 +475,19 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			}
 
 		case "PAUSE_TASK":
+			if task.Status != "RUNNING" {
+				srvLogf("device=%s: ignoring PAUSE_TASK, task is %s", taskID, task.Status)
+				mutex.Unlock()
+				continue
+			}
 			task.Status = "PAUSED"
 			srvLogf("device=%s: PAUSE_TASK", taskID)
 		case "RESUME_TASK":
+			if task.Status != "PAUSED" {
+				srvLogf("device=%s: ignoring RESUME_TASK, task is %s", taskID, task.Status)
+				mutex.Unlock()
+				continue
+			}
 			task.Status = "RUNNING"
 			srvLogf("device=%s: RESUME_TASK", taskID)
 		case "ANSWER":
@@ -442,15 +497,26 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			answer := strings.TrimSpace(action.Description)
+			if answer == "" && task.QuestionKind != "budget" {
+				srvLogf("device=%s: ignoring empty ANSWER", taskID)
+				mutex.Unlock()
+				continue
+			}
 			srvLogf("device=%s: ANSWER to %s question %q: %q", taskID, task.QuestionKind, task.Question, answer)
 			task = applyAnswer(task, answer, time.Now())
+			bump = true
 		case "CANCEL_TASK":
 			task = resetTask(task.DeviceID)
+			bump = true
 			srvLogf("device=%s: CANCEL_TASK, task reset", taskID)
 		default:
 			srvLogf("device=%s: unknown action type: %q", taskID, action.Type)
 			mutex.Unlock()
 			continue
+		}
+
+		if bump {
+			task.Seq = prevSeq + 1
 		}
 
 		if task.Status != prevStatus {

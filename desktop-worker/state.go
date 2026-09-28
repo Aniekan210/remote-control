@@ -41,6 +41,13 @@ func (s *State) CurrentStatus() string {
 	return s.lastTask.Status
 }
 
+// LastTask returns the most recently received task state.
+func (s *State) LastTask() Task {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastTask
+}
+
 // UpdateTask stores the freshly received task and reports whether it
 // actually differs from what we last saw. Duplicate/no-op broadcasts
 // (which the server can legitimately send) are filtered out here so
@@ -49,11 +56,8 @@ func (s *State) UpdateTask(newTask Task) (prev Task, changed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev = s.lastTask
-	if reflect.DeepEqual(prev, newTask) {
-		return prev, false
-	}
 	s.lastTask = newTask
-	return prev, true
+	return prev, !reflect.DeepEqual(prev, newTask)
 }
 
 // TaskChange is pushed from the WebSocket reader to the executor whenever

@@ -59,6 +59,13 @@ func envDuration(key string, def time.Duration) time.Duration {
 // TaskChange delivered here represents a genuinely new state, so there's
 // no risk of re-executing the same ExecutionList twice.
 func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overlay chan<- OverlayState, fsStore *SnapshotStore) {
+	// lastSeq is the Seq of the last state this executor acted on (ran its
+	// actions / sent its ADVANCE). Seeing the same Seq again — after a
+	// resume, or the state the server re-sends on reconnect — means "you
+	// already did this; the ADVANCE may have been dropped": send the
+	// ADVANCE again, but never replay the actions.
+	lastSeq := 0
+
 	for change := range changes {
 		cur := change.Cur
 
@@ -68,6 +75,26 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 			continue
 		}
 
+		// A newer state has already arrived behind this one (e.g. a cancel
+		// or a pause landed while the previous batch was running): acting
+		// on this one would replay stale clicks. Skip it; the newer state
+		// is already queued behind it.
+		if latest := state.LastTask(); latest.Seq != cur.Seq || latest.Status != "RUNNING" {
+			log.Printf("executor: skipping stale state seq=%d (newest is seq=%d, %s)", cur.Seq, latest.Seq, latest.Status)
+			continue
+		}
+
+		if cur.Seq < lastSeq {
+			// The server restarted and its sequence started over.
+			lastSeq = 0
+		}
+		if cur.Seq != 0 && cur.Seq == lastSeq {
+			log.Printf("executor: seq=%d already handled — re-sending ADVANCE without replaying actions", cur.Seq)
+			sendAdvance(state, deviceID, cur.Context, fsQuery(cur), fsStore, "", cur.Seq)
+			continue
+		}
+		lastSeq = cur.Seq
+
 		if len(cur.ExecutionList) > 0 {
 			// Refuse the whole list up front if any action can't be
 			// carried out (bad coordinates, unknown type): half-running
@@ -75,17 +102,17 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 			// The error goes back to the server, which revises the plan.
 			if err := validateExecutions(cur.ExecutionList); err != nil {
 				log.Printf("executor: refusing execution list: %v", err)
-				sendAdvance(state, deviceID, false, "", fsStore, err.Error())
+				sendAdvance(state, deviceID, false, "", fsStore, err.Error(), cur.Seq)
 				continue
 			}
 			executeList(cur.ExecutionList, overlay, overlayStateFor(cur))
-			sendAdvance(state, deviceID, false, "", fsStore, "")
+			sendAdvance(state, deviceID, false, "", fsStore, "", cur.Seq)
 			continue
 		}
 
 		// Our turn to ask for the next step. The filesystem snapshot is
 		// attached whenever Context is true (a plan or a revise is next).
-		sendAdvance(state, deviceID, cur.Context, fsQuery(cur), fsStore, "")
+		sendAdvance(state, deviceID, cur.Context, fsQuery(cur), fsStore, "", cur.Seq)
 	}
 }
 
@@ -116,8 +143,9 @@ func validateExecutions(execs []Execution) error {
 // sendAdvance captures the settled screen and sends ADVANCE. When includeFS
 // is set it attaches the filtered filesystem snapshot, using query (the
 // task text) to pick which entries are relevant. workerErr, if set, tells
-// the server the last step couldn't be carried out here.
-func sendAdvance(state *State, deviceID string, includeFS bool, query string, fsStore *SnapshotStore, workerErr string) {
+// the server the last step couldn't be carried out here. seq is the
+// Task.Seq this ADVANCE answers; the server ignores it once it has moved on.
+func sendAdvance(state *State, deviceID string, includeFS bool, query string, fsStore *SnapshotStore, workerErr string, seq int) {
 	// Don't capture or advance while the human is driving the mouse.
 	takeover.Gate()
 
@@ -143,6 +171,7 @@ func sendAdvance(state *State, deviceID string, includeFS bool, query string, fs
 		DeviceID:          deviceID,
 		ScreenshotPayload: shot,
 		Error:             workerErr,
+		Seq:               seq,
 	}
 	if includeFS {
 		snap := fsStore.Snapshot(query)

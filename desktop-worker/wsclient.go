@@ -85,6 +85,11 @@ func RunWSClient(ctx context.Context, serverAddr, deviceID, secret, wsURL string
 }
 
 func readLoop(ctx context.Context, conn *websocket.Conn, state *State, changes chan<- TaskChange) {
+	// The first TASK_UPDATE after (re)connecting is the server's current
+	// state. It's passed on even if it equals what we last saw: if our
+	// ADVANCE was lost in the drop, the executor sees the same Seq again
+	// and re-sends it, instead of both sides waiting on each other forever.
+	first := true
 	for {
 		_, msg, err := conn.Read(ctx)
 		if err != nil {
@@ -102,7 +107,9 @@ func readLoop(ctx context.Context, conn *websocket.Conn, state *State, changes c
 		}
 
 		prev, changed := state.UpdateTask(update.Payload)
-		if !changed {
+		resync := first
+		first = false
+		if !changed && !resync {
 			continue
 		}
 		// A genuinely user-driven update (resume, cancel, or a new task) is
@@ -111,7 +118,7 @@ func readLoop(ctx context.Context, conn *websocket.Conn, state *State, changes c
 		// status) are NOT treated as resume, so an in-flight AI result can't
 		// silently cancel a takeover pause. This runs on the wsclient
 		// goroutine, so it works even while the executor is blocked in Gate().
-		if isUserResumeSignal(prev, update.Payload) {
+		if changed && isUserResumeSignal(prev, update.Payload) {
 			takeover.ServerResume()
 		}
 		changes <- TaskChange{Prev: prev, Cur: update.Payload}

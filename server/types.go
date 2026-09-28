@@ -40,7 +40,8 @@ type Task struct {
 	CostBase     float64   `json:"-"` // CostUSD at the start of the current window
 	StartedAt    time.Time `json:"-"` // start of the current window, for MAX_TASK_DURATION
 
-	InstrAttempts int `json:"-"` // executor calls on the current instruction (capped, then replan)
+	InstrAttempts int  `json:"-"` // executor calls on the current instruction (capped, then replan)
+	InFlight      bool `json:"-"` // an AI call for the current Seq is running; further ADVANCEs for it are duplicates
 }
 
 type Execution struct {
@@ -58,6 +59,7 @@ type Action struct {
 	FileSystemPayload []FileEntry `json:"file_system_payload"` // for ADVANCE
 	ScreenshotPayload Screenshot  `json:"screenshot_payload"`
 	Error             string      `json:"error"` // for ADVANCE: the worker couldn't carry out the last step (screenshot failed, bad coordinates, unknown action)
+	Seq               int         `json:"seq"`   // for ADVANCE: the Task.Seq the worker acted on; stale ones are ignored
 }
 
 type FileEntry struct {
