@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/coder/websocket"
@@ -14,9 +15,18 @@ import (
 // backoff on any drop. On reconnect the server re-sends the current state
 // (see handleWebSocketConnections/sendTaskState server-side), so the
 // worker naturally resyncs — no extra recovery logic needed here.
-func RunWSClient(ctx context.Context, wsURL string, state *State, changes chan<- TaskChange) {
+//
+// Rooms live only in the server's memory, so after a server restart every
+// dial comes back 404 ("room does not exist") forever. serverAddr and
+// deviceID are here so a 404 can re-register the room (POST /rooms) and
+// redial straight away instead of backing off into that dead end.
+func RunWSClient(ctx context.Context, serverAddr, deviceID, wsURL string, state *State, changes chan<- TaskChange) {
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
+	// justReregistered stops a 404 -> register -> 404 loop from spinning
+	// with no delay if the server keeps losing the room (e.g. it's
+	// crash-looping): only the first redial after a re-register is instant.
+	justReregistered := false
 
 	for {
 		select {
@@ -25,8 +35,19 @@ func RunWSClient(ctx context.Context, wsURL string, state *State, changes chan<-
 		default:
 		}
 
-		conn, _, err := websocket.Dial(ctx, wsURL, nil)
+		conn, resp, err := websocket.Dial(ctx, wsURL, nil)
 		if err != nil {
+			if resp != nil && resp.StatusCode == http.StatusNotFound && !justReregistered {
+				log.Printf("wsclient: dial got 404 (server lost our room, probably restarted) — re-registering and redialing")
+				if rerr := RegisterRoom(serverAddr, deviceID); rerr != nil {
+					log.Printf("wsclient: re-register failed: %v (retrying in %s)", rerr, backoff)
+				} else {
+					backoff = time.Second
+					justReregistered = true
+					continue
+				}
+			}
+			justReregistered = false
 			log.Printf("wsclient: dial failed: %v (retrying in %s)", err, backoff)
 			select {
 			case <-ctx.Done():
@@ -39,6 +60,7 @@ func RunWSClient(ctx context.Context, wsURL string, state *State, changes chan<-
 
 		log.Printf("wsclient: connected")
 		backoff = time.Second
+		justReregistered = false
 
 		// The default coder/websocket read limit is 32 KiB. TASK_UPDATE
 		// broadcasts are small, but raise it far past that so a large

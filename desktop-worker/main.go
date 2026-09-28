@@ -136,7 +136,7 @@ func main() {
 	fsStore := NewSnapshotStore()
 
 	go RunFSWatcher(ctx, defaultWatchRoots(), fsStore)
-	go RunWSClient(ctx, wsURL, state, changes)
+	go RunWSClient(ctx, serverAddr, deviceID, wsURL, state, changes)
 	go RunExecutor(state, deviceID, changes, overlayUpdates, fsStore)
 
 	// The overlay is the riskiest code in this project — raw Win32 window
