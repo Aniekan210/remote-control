@@ -69,17 +69,20 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 
 		if len(cur.ExecutionList) > 0 {
 			executeList(cur.ExecutionList, overlay, overlayStateFor(cur))
-			sendAdvance(state, deviceID, false, fsStore)
+			sendAdvance(state, deviceID, false, "", fsStore)
 			continue
 		}
 
 		// Our turn to ask for the next step. Only attach the filesystem
 		// snapshot on the very first ADVANCE of a task (Context == true).
-		sendAdvance(state, deviceID, cur.Context, fsStore)
+		sendAdvance(state, deviceID, cur.Context, cur.Description, fsStore)
 	}
 }
 
-func sendAdvance(state *State, deviceID string, includeFS bool, fsStore *SnapshotStore) {
+// sendAdvance captures the settled screen and sends ADVANCE. When includeFS
+// is set it attaches the filtered filesystem snapshot, using query (the
+// task description) to pick which entries are relevant.
+func sendAdvance(state *State, deviceID string, includeFS bool, query string, fsStore *SnapshotStore) {
 	// Don't capture or advance while the human is driving the mouse.
 	takeover.Gate()
 
@@ -97,7 +100,7 @@ func sendAdvance(state *State, deviceID string, includeFS bool, fsStore *Snapsho
 		ScreenshotPayload: shot,
 	}
 	if includeFS {
-		snap := fsStore.Snapshot()
+		snap := fsStore.Snapshot(query)
 		action.FileSystemPayload = snap
 		// Log the newest few entries so you can confirm, from the worker
 		// log, that recently-created files (a just-taken screenshot, a fresh

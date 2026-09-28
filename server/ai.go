@@ -200,24 +200,22 @@ USE ALL THE CONTEXT
 ────────────────────────────────────────
 USING THE FILESYSTEM — FILES & RECENCY
 ────────────────────────────────────────
-- The filesystem is a JSON array of entries, each with: path (full Windows
-  path), type (0=file, 1=directory), size, and mod_time (Unix seconds since
-  1970). It is provided SORTED NEWEST-FIRST — the most recently modified
-  files are at the TOP of the array.
-- "Current time (Unix seconds)" is given alongside it; use it to judge how
-  recent a file is (e.g. "earlier this month" vs "today").
-- For "most recent" / "last" / "latest" requests (e.g. "open the last
-  screenshot I took"), choose the entry with the LARGEST mod_time that
-  matches — screenshots are typically PNGs whose path contains
-  "Screenshot" and usually live under Pictures\Screenshots. Do NOT just pick
-  any file whose name contains the keyword; pick the newest matching one by
-  mod_time.
-- When the task refers to a specific file, resolve it against the filesystem
-  and put the EXACT file name (and its folder) into the instruction, so the
-  executor knows precisely what to open — e.g.
-  "Open the file 'Screenshot 2026-09-27 143022.png' from the
-  Pictures\Screenshots folder." Prefer opening a file directly from its
-  folder in File Explorer over guessing a path from memory.
+- The filesystem is given one entry per line: "D" (folder) or "F" (file),
+  its age since last modified ("5m", "2h", "3d"), then its path, with the
+  user's home folder written as "~". Example:
+    F  5m  ~\Pictures\Screenshots\Screenshot 2026-09-27 143022.png
+- The list is FILTERED, NOT COMPLETE: it holds the top-level folders, the
+  entries whose names match words in the task, and the newest files. A file
+  missing from the list may still exist.
+- It is sorted NEWEST-FIRST. For "most recent" / "last" / "latest" requests
+  (e.g. "open the last screenshot I took"), pick the matching entry with the
+  SMALLEST age — screenshots are usually PNGs whose name contains
+  "Screenshot", under Pictures\Screenshots. Don't just pick any file whose
+  name contains the keyword.
+- When the task refers to a specific file, put its EXACT name (and folder)
+  into the instruction, e.g. "Open the file 'Screenshot 2026-09-27
+  143022.png' from the Pictures\Screenshots folder." Prefer opening a file
+  from its folder in File Explorer over guessing a path.
 
 ────────────────────────────────────────
 OUTPUT
@@ -228,11 +226,7 @@ no markdown code fences:
 {"instructions": ["...", "..."]}
 `
 
-		fs, err := json.Marshal(action.FileSystemPayload)
-		if err != nil {
-			aiLogf("[%s] FAILED marshal filesystem payload: %v", callID, err)
-			return nil, 0, fmt.Errorf("marshal filesystem payload: %w", err)
-		}
+		fs := formatFileList(action.FileSystemPayload, time.Now())
 
 		// The task description lives on the Task (set at CREATE_TASK), NOT on
 		// this ADVANCE action — an ADVANCE carries no Description, so reading
@@ -245,8 +239,8 @@ no markdown code fences:
 			map[string]any{
 				"type": "text",
 				"text": fmt.Sprintf(
-					"Task:\n%s\n\nCurrent time (Unix seconds): %d\n\nFilesystem (sorted newest-first by mod_time):\n%s",
-					task.Description, time.Now().Unix(), string(fs),
+					"Task:\n%s\n\nFilesystem (filtered, newest first):\n%s",
+					task.Description, fs,
 				),
 			},
 		}
@@ -701,6 +695,40 @@ func parseInstructionList(response string) ([]string, error) {
 		}
 	}
 	return nil, fmt.Errorf("no array of instruction strings found in response object")
+}
+
+// formatFileList renders the worker's filesystem snapshot as one compact
+// line per entry — "D  2h  ~\Desktop\Hackathon" — instead of a JSON object
+// per file. Same information the planner uses (kind, recency, path) at a
+// fraction of the tokens; size is dropped. Order is preserved (the worker
+// sends it newest-first).
+func formatFileList(entries []FileEntry, now time.Time) string {
+	if len(entries) == 0 {
+		return "(no entries)"
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		kind := "F"
+		if e.Type == 1 {
+			kind = "D"
+		}
+		fmt.Fprintf(&b, "%s  %s  %s\n", kind, relativeAge(now.Unix()-e.ModTime), e.Path)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// relativeAge turns an age in seconds into "5m", "2h" or "3d".
+func relativeAge(secs int64) string {
+	switch {
+	case secs < 60:
+		return "0m"
+	case secs < 3600:
+		return fmt.Sprintf("%dm", secs/60)
+	case secs < 86400:
+		return fmt.Sprintf("%dh", secs/3600)
+	default:
+		return fmt.Sprintf("%dd", secs/86400)
+	}
 }
 
 // cleanJSONResponse strips markdown code fences that some models add
