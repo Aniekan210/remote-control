@@ -266,6 +266,9 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				InstructionList:         make([]string, 0),
 				ExecutionList:           make([]Execution, 0),
 				Context:                 true,
+				Answers:                 make([]string, 0),
+				ConfirmedIndex:          -1,
+				NeedsConfirm:            make([]bool, 0),
 				StartedAt:               time.Now(),
 			}
 			srvLogf("device=%s: CREATE_TASK description=%q (full state reset)", taskID, action.Description)
@@ -508,6 +511,9 @@ func resetTask(deviceID string) Task {
 		InstructionList:         make([]string, 0),
 		ExecutionList:           make([]Execution, 0),
 		Context:                 false,
+		Answers:                 make([]string, 0),
+		ConfirmedIndex:          -1,
+		NeedsConfirm:            make([]bool, 0),
 	}
 }
 

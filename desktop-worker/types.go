@@ -17,8 +17,20 @@ type Task struct {
 	InstructionList         []string    `json:"instruction_list"`
 	ExecutionList           []Execution `json:"execution_list"`
 	Context                 bool        `json:"context"`
-	CostUSD                 float64     `json:"cost_usd"`
-	LastError               string      `json:"last_error"`
+	// Seq is the only one of the fields below the worker acts on (it is
+	// echoed in every ADVANCE); the rest are here so the JSON round-trips
+	// cleanly and so state changes are seen in full.
+	Seq            int      `json:"seq"`
+	Reason         string   `json:"reason"`
+	Question       string   `json:"question"`
+	QuestionKind   string   `json:"question_kind"`
+	QuestionImage  string   `json:"question_image"`
+	Answers        []string `json:"answers"`
+	AutoReplans    int      `json:"auto_replans"`
+	ConfirmedIndex int      `json:"confirmed_index"`
+	NeedsConfirm   []bool   `json:"needs_confirm"`
+	CostUSD        float64  `json:"cost_usd"`
+	LastError      string   `json:"last_error"`
 }
 
 type Execution struct {

@@ -21,6 +21,15 @@ type Task struct {
 	InstructionList         []string    `json:"instruction_list"` // list of instructions from initial AI breakdown
 	ExecutionList           []Execution `json:"execution_list"`   // list of executions after AI solves singular instruction
 	Context                 bool        `json:"context"`          // boolean asking for context from the desktop worker
+	Seq                     int         `json:"seq"`              // bumped on every broadcast the worker must act on; the worker echoes it in ADVANCE
+	Reason                  string      `json:"reason"`           // why the next planner call is a revise rather than a fresh plan; "" on the first plan
+	Question                string      `json:"question"`         // shown to the user while Status == NEEDS_INPUT
+	QuestionKind            string      `json:"question_kind"`    // "blocked" / "confirm" / "budget"
+	QuestionImage           string      `json:"question_image"`   // data:image/jpeg;base64,... of the screen when the question was asked; cleared once answered
+	Answers                 []string    `json:"answers"`          // every "Q: … / A: …" pair so far, sent to every revise call
+	AutoReplans             int         `json:"auto_replans"`     // automatic revises so far (capped)
+	ConfirmedIndex          int         `json:"confirmed_index"`  // index of the last step the user approved; -1 = none
+	NeedsConfirm            []bool      `json:"needs_confirm"`    // parallel to InstructionList: steps that must be approved first
 	CostUSD                 float64     `json:"cost_usd"`         // total OpenRouter spend on this task so far
 	LastError               string      `json:"last_error"`       // one-off error for the client (budget reached, ...); cleared on the next accepted action
 
