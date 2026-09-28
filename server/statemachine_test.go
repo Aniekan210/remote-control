@@ -336,6 +336,13 @@ func TestStateMachine(t *testing.T) {
 			mustEqual(t, "index", task.CurrentInstructionIndex, 0)
 			mustEqual(t, "not in flight", task.InFlight, false)
 
+			// Even a failed call that lands while paused just gets retried.
+			task = onClientAction(task, Action{Type: "RESUME_TASK"})
+			task = onClientAction(task, advance(seq))
+			task = onClientAction(task, Action{Type: "PAUSE_TASK"})
+			task = onAIResult(task, AIResult{Seq: seq, Err: errors.New("timeout")})
+			mustEqual(t, "failure while paused doesn't stop the task", task.Status, "PAUSED")
+
 			// ADVANCE while paused is ignored; after resume the same seq works.
 			task = onClientAction(task, advance(seq))
 			mustEqual(t, "ignored while paused", task.InFlight, false)

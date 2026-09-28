@@ -665,8 +665,15 @@ func callOpenRouter(callID, mode, model, systemPrompt string, userContent []any,
 // structured-output request (rather than, say, a bad image).
 func mentionsResponseFormat(msg string) bool {
 	m := strings.ToLower(msg)
-	return strings.Contains(m, "response_format") || strings.Contains(m, "json_schema") ||
-		strings.Contains(m, "structured output") || strings.Contains(m, "response format")
+	for _, w := range []string{
+		"response_format", "response format", "json_schema", "response_schema", "responseschema",
+		"structured output", "additionalproperties", "schema",
+	} {
+		if strings.Contains(m, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // postChatCompletion performs the HTTP call. status is the HTTP status (0

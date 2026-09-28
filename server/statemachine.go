@@ -245,6 +245,15 @@ func onAIResult(t Task, r AIResult) Task {
 	}
 
 	switch {
+	case t.Status != "RUNNING":
+		// Paused while the call was in flight (the person took over the
+		// mouse, or paused from the phone): the screen may no longer be
+		// what the AI saw, so drop the result — even a failure. The worker
+		// re-sends its ADVANCE for this Seq on resume and a fresh call is
+		// made then.
+		srvLogf("device=%s: dropping AI result, task was %s while the call was in flight", t.DeviceID, t.Status)
+		return t
+
 	case r.Err != nil:
 		// Never remaking a room, so give up by resetting the task to a
 		// clean slate instead of deleting it from the table.
@@ -256,10 +265,6 @@ func onAIResult(t Task, r AIResult) Task {
 			next.LastError = msg
 		}
 		return next
-
-	case t.Status != "RUNNING":
-		srvLogf("device=%s: dropping AI result, task was %s while the call was in flight", t.DeviceID, t.Status)
-		return t
 
 	case r.Planning:
 		t = applyPlan(t, r.Plan, r.Image)
