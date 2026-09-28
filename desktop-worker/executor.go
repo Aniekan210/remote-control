@@ -100,12 +100,13 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 			// carried out (bad coordinates, unknown type): half-running
 			// a batch leaves the screen in a state nobody planned for.
 			// The error goes back to the server, which revises the plan.
-			if err := validateExecutions(cur.ExecutionList); err != nil {
+			execs, err := toScreenExecutions(cur.ExecutionList, state.Frame())
+			if err != nil {
 				log.Printf("executor: refusing execution list: %v", err)
 				sendAdvance(state, deviceID, false, "", fsStore, err.Error(), cur.Seq)
 				continue
 			}
-			executeList(cur.ExecutionList, overlay, overlayStateFor(cur))
+			executeList(execs, overlay, overlayStateFor(cur))
 			sendAdvance(state, deviceID, false, "", fsStore, "", cur.Seq)
 			continue
 		}
@@ -122,22 +123,27 @@ func fsQuery(t Task) string {
 	return strings.Join(append([]string{t.Description, t.Reason}, t.Answers...), " ")
 }
 
-// validateExecutions checks every action can actually be performed here:
-// a known type, and mouse coordinates on the (primary) screen.
-func validateExecutions(execs []Execution) error {
-	w, h := screenSize()
+// toScreenExecutions checks every action can actually be performed here —
+// a known type, and mouse coordinates on the screenshot the AI saw — and
+// returns a copy with the coordinates scaled from that screenshot to real
+// screen pixels (the screenshot is downscaled; see scaling.go).
+func toScreenExecutions(execs []Execution, frame shotFrame) ([]Execution, error) {
+	out := make([]Execution, len(execs))
 	for i, e := range execs {
 		switch e.Type {
 		case "MOUSE_MOVEMENT":
-			if w > 0 && h > 0 && (e.MousePosX < 0 || e.MousePosY < 0 || e.MousePosX >= w || e.MousePosY >= h) {
-				return fmt.Errorf("action %d: coordinates (%d, %d) are outside the %dx%d screen", i+1, e.MousePosX, e.MousePosY, w, h)
+			x, y, err := frame.toScreen(e.MousePosX, e.MousePosY)
+			if err != nil {
+				return nil, fmt.Errorf("action %d: %w", i+1, err)
 			}
+			e.MousePosX, e.MousePosY = x, y
 		case "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT":
 		default:
-			return fmt.Errorf("action %d: unknown action type %q", i+1, e.Type)
+			return nil, fmt.Errorf("action %d: unknown action type %q", i+1, e.Type)
 		}
+		out[i] = e
 	}
-	return nil
+	return out, nil
 }
 
 // sendAdvance captures the settled screen and sends ADVANCE. When includeFS
@@ -153,17 +159,28 @@ func sendAdvance(state *State, deviceID string, includeFS bool, query string, fs
 	// planned against a fully-rendered screen rather than a mid-load one.
 	// A failed capture is retried once; if it fails again the server is
 	// told (instead of the task silently stalling here forever).
-	shot, err := CaptureStableScreen(settleInitial, settlePoll, settleMax)
+	// Planner calls (includeFS) always get the downscaled image; executor
+	// calls too, unless EXECUTOR_FULL_RES is set.
+	fullRes := executorFullRes && !includeFS
+	shot, err := CaptureStableScreen(settleInitial, settlePoll, settleMax, fullRes)
 	if err != nil {
 		log.Printf("executor: screenshot failed: %v — retrying once", err)
 		time.Sleep(500 * time.Millisecond)
-		shot, err = CaptureStableScreen(settleInitial, settlePoll, settleMax)
+		shot, err = CaptureStableScreen(settleInitial, settlePoll, settleMax, fullRes)
 	}
 	if err != nil {
 		log.Printf("executor: screenshot failed twice: %v — reporting it to the server", err)
 		if workerErr == "" {
 			workerErr = "taking a screenshot failed twice: " + err.Error()
 		}
+	} else {
+		// The actions that come back are in this image's coordinates.
+		state.SetFrame(shotFrame{
+			imgW: int(shot.Width), imgH: int(shot.Height),
+			screenW: int(shot.ScreenWidth), screenH: int(shot.ScreenHeight),
+		})
+		log.Printf("executor: screenshot %dx%d %s (%d KB) of a %dx%d screen",
+			shot.Width, shot.Height, shot.Format, len(shot.Data)/1024, shot.ScreenWidth, shot.ScreenHeight)
 	}
 
 	action := Action{
@@ -217,6 +234,7 @@ func executeList(execs []Execution, overlay chan<- OverlayState, base OverlaySta
 
 		switch e.Type {
 		case "MOUSE_MOVEMENT":
+			// Already scaled to screen pixels by toScreenExecutions.
 			MoveMouse(e.MousePosX, e.MousePosY)
 
 		case "LEFT_CLICK":
@@ -247,7 +265,7 @@ func executeList(execs []Execution, overlay chan<- OverlayState, base OverlaySta
 			TypeText(e.KeyString)
 
 		default:
-			// validateExecutions rejects these before anything runs.
+			// toScreenExecutions rejects these before anything runs.
 			log.Printf("executor: unknown execution type %q", e.Type)
 		}
 

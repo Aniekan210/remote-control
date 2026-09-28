@@ -75,8 +75,10 @@ type FileEntry struct {
 }
 
 type Screenshot struct {
-	Format string `json:"format"`
-	Width  uint32 `json:"width"`
-	Height uint32 `json:"height"`
-	Data   []byte `json:"data"`
+	Format       string `json:"format"` // "jpeg" (downscaled by the worker) or "png" (native resolution)
+	Width        uint32 `json:"width"`  // size of the image the AI sees — its coordinates are in this frame
+	Height       uint32 `json:"height"`
+	ScreenWidth  uint32 `json:"screen_width"` // the real screen's size; the worker scales coordinates back to it
+	ScreenHeight uint32 `json:"screen_height"`
+	Data         []byte `json:"data"`
 }

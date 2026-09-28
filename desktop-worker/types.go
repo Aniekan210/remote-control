@@ -69,8 +69,12 @@ const (
 )
 
 type Screenshot struct {
-	Format string `json:"format"`
-	Width  uint32 `json:"width"`
+	Format string `json:"format"` // "jpeg" (downscaled) or "png" (native, EXECUTOR_FULL_RES)
+	Width  uint32 `json:"width"`  // size of the image sent — the frame the AI's coordinates are in
 	Height uint32 `json:"height"`
-	Data   []byte `json:"data"` // encoding/json base64-encodes []byte automatically
+	// The real screen's size. The worker scales the AI's coordinates from
+	// Width x Height back to this before moving the mouse.
+	ScreenWidth  uint32 `json:"screen_width"`
+	ScreenHeight uint32 `json:"screen_height"`
+	Data         []byte `json:"data"` // encoding/json base64-encodes []byte automatically
 }

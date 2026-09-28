@@ -1,5 +1,7 @@
 package main
 
+import "strings"
+
 // System prompts. Both are STATIC — nothing per-call is formatted into them
 // — and are sent as the first message, with the dynamic content (task,
 // filesystem, instruction, screenshot) after them in the user message, so
@@ -99,6 +101,32 @@ Only JSON, no prose, no code fences:
 {"decision": "continue", "message": "", "instructions": [{"text": "...", "needs_confirmation": false}]}
 `
 
+// executorPixelCoords is the part of the executor prompt that defines the
+// coordinate space; executorPrompt swaps it for norm1000 models.
+const executorPixelCoords = `- The screenshot's EXACT size in pixels (width x height) is given with the
+  instruction. Your coordinates are in that same pixel space, 1:1 — there
+  is no scaling, DPI adjustment, or offset for you to apply; the computer
+  maps the image onto its real screen itself. A coordinate you output is
+  the exact pixel of the image the cursor moves to.
+- (0,0) is the top-left pixel. x increases rightward to width-1; y increases
+  downward to height-1. Every coordinate MUST fall inside the screen:
+  0 <= x < width and 0 <= y < height.`
+
+const executorNorm1000Coords = `- Coordinates are NORMALIZED to 0–1000 on both axes, whatever the image's
+  pixel size: (0,0) is the top-left corner and (1000,1000) the bottom-right.
+  x increases rightward, y downward. Every coordinate MUST be within
+  0..1000. The computer maps them onto its real screen itself.`
+
+// executorPrompt returns the executor system prompt for a coordinate mode
+// (EXECUTION_COORDS): "pixels" or "norm1000". Static per mode, so still
+// cacheable.
+func executorPrompt(mode string) string {
+	if mode == coordsNorm1000 {
+		return strings.Replace(executorSystemPrompt, executorPixelCoords, executorNorm1000Coords, 1)
+	}
+	return executorSystemPrompt
+}
+
 // executorSystemPrompt turns ONE instruction plus the screenshot into
 // physical mouse/keyboard actions. The screenshot size is sent with the
 // instruction in the user message.
@@ -186,10 +214,10 @@ safe action list that succeeds is always better than a short one that misses.
 COORDINATES — BE MAXIMALLY PRECISE
 ────────────────────────────────────────
 - The screenshot's EXACT size in pixels (width x height) is given with the
-  instruction, and it is the machine's true native resolution. Your
-  coordinates are in that same pixel space, 1:1 — there is no scaling, DPI
-  adjustment, or offset to apply. A coordinate you output is the exact
-  on-screen pixel the cursor moves to.
+  instruction. Your coordinates are in that same pixel space, 1:1 — there
+  is no scaling, DPI adjustment, or offset for you to apply; the computer
+  maps the image onto its real screen itself. A coordinate you output is
+  the exact pixel of the image the cursor moves to.
 - (0,0) is the top-left pixel. x increases rightward to width-1; y increases
   downward to height-1. Every coordinate MUST fall inside the screen:
   0 <= x < width and 0 <= y < height.

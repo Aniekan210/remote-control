@@ -14,6 +14,22 @@ type State struct {
 	mu       sync.Mutex
 	conn     *websocket.Conn
 	lastTask Task
+	frame    shotFrame // the last screenshot sent: the frame the next actions' coordinates are in
+}
+
+// SetFrame records the size of the screenshot just sent (and of the real
+// screen), so the actions that come back can be scaled onto the screen.
+func (s *State) SetFrame(f shotFrame) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.frame = f
+}
+
+// Frame returns the last screenshot's frame.
+func (s *State) Frame() shotFrame {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.frame
 }
 
 func NewState() *State {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -73,6 +74,23 @@ func plannerOptions() callOptions {
 		opts.reasoningEffort = ""
 	}
 	return opts
+}
+
+// Coordinate spaces the executor model can answer in (EXECUTION_COORDS).
+// Qwen2.5-VL grounds in image pixels; some newer grounding models answer in
+// 0–1000 normalized coordinates — check the model card. Normalized answers
+// are converted to image pixels here, so the worker always gets pixels of
+// the image it sent (and scales those to the real screen itself).
+const (
+	coordsPixels   = "pixels"
+	coordsNorm1000 = "norm1000"
+)
+
+func executionCoords() string {
+	if os.Getenv("EXECUTION_COORDS") == coordsNorm1000 {
+		return coordsNorm1000
+	}
+	return coordsPixels
 }
 
 // modelForContext returns the model for the current call. planning==true
@@ -243,6 +261,8 @@ func callPlanner(callID string, task Task, action Action, key apiKey) (any, floa
 			callID, task.Description, len(action.FileSystemPayload))
 	}
 
+	text += fmt.Sprintf("\n\nScreenshot: %dx%d pixels.", action.ScreenshotPayload.Width, action.ScreenshotPayload.Height)
+
 	userContent := []any{
 		map[string]any{"type": "text", "text": text},
 		screenshotContent(action.ScreenshotPayload),
@@ -373,8 +393,9 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 
 	// No output cap for the executor: it's cheap, and a long, careful action
 	// list is worth more than the tokens it saves to cut it short.
+	coords := executionCoords()
 	response, cost, err := callOpenRouter(callID, "EXECUTION", modelForContext(false),
-		executorSystemPrompt, userContent, "actions", executionSchema, callOptions{}, key)
+		executorPrompt(coords), userContent, "actions", executionSchema, callOptions{}, key)
 	if err != nil {
 		return nil, cost, err
 	}
@@ -383,6 +404,9 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 	if err != nil {
 		aiLogf("[%s] FAILED invalid execution result: %v, cleaned response: %s", callID, err, response)
 		return nil, cost, fmt.Errorf("invalid execution result: %w (raw: %s)", err, response)
+	}
+	if coords == coordsNorm1000 {
+		res.Actions = norm1000ToPixels(res.Actions, int(w), int(h))
 	}
 
 	aiLogf("[%s] SUCCESS execution: verdict=%s done=%v reason=%q %d actions: %+v",
@@ -421,8 +445,26 @@ func executorUserText(task Task, instruction string, idx int, w, h uint32) strin
 			fmt.Fprintf(&b, "- %s\n", a)
 		}
 	}
-	fmt.Fprintf(&b, "\nScreenshot size: %dx%d pixels (0 <= x < %d, 0 <= y < %d).", w, h, w, h)
+	if executionCoords() == coordsNorm1000 {
+		fmt.Fprintf(&b, "\nScreenshot size: %dx%d pixels. Give coordinates normalized to 0–1000, not pixels.", w, h)
+	} else {
+		fmt.Fprintf(&b, "\nScreenshot size: %dx%d pixels (0 <= x < %d, 0 <= y < %d).", w, h, w, h)
+	}
 	return b.String()
+}
+
+// norm1000ToPixels converts 0–1000 normalized mouse coordinates to pixels
+// of a w x h image.
+func norm1000ToPixels(actions []Execution, w, h int) []Execution {
+	out := make([]Execution, len(actions))
+	for i, a := range actions {
+		if a.Type == "MOUSE_MOVEMENT" && w > 0 && h > 0 {
+			a.MousePosX = int(math.Round(float64(a.MousePosX) / 1000 * float64(w-1)))
+			a.MousePosY = int(math.Round(float64(a.MousePosY) / 1000 * float64(h-1)))
+		}
+		out[i] = a
+	}
+	return out
 }
 
 // parseExecResult decodes and validates the executor's output. It is

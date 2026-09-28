@@ -3,10 +3,8 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"image"
-	"image/png"
 	"log"
 	"time"
 	"unsafe"
@@ -56,16 +54,8 @@ type bitmapInfoHeader struct {
 	ClrImportant  uint32
 }
 
-// screenSize returns the primary display's size in real pixels (the
-// process is DPI-aware), or 0,0 if it can't be read.
-func screenSize() (w, h int) {
-	width, _, _ := procGetSystemMetrics.Call(uintptr(smCxScreen))
-	height, _, _ := procGetSystemMetrics.Call(uintptr(smCyScreen))
-	return int(int32(width)), int(int32(height))
-}
-
 // captureImage grabs the primary display into an *image.RGBA. This is the
-// raw capture; PNG encoding and stability polling are layered on top.
+// raw capture; encoding (scaling.go) and stability polling are layered on top.
 func captureImage() (*image.RGBA, error) {
 	width, _, _ := procGetSystemMetrics.Call(uintptr(smCxScreen))
 	height, _, _ := procGetSystemMetrics.Call(uintptr(smCyScreen))
@@ -135,29 +125,14 @@ func captureImage() (*image.RGBA, error) {
 	return img, nil
 }
 
-// encode wraps an *image.RGBA as a PNG Screenshot payload.
-func encode(img *image.RGBA) (Screenshot, error) {
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return Screenshot{}, err
-	}
-	b := img.Bounds()
-	return Screenshot{
-		Format: "png",
-		Width:  uint32(b.Dx()),
-		Height: uint32(b.Dy()),
-		Data:   buf.Bytes(),
-	}, nil
-}
-
-// CaptureScreen grabs the primary display and encodes it as PNG (a single
-// instantaneous frame, no settling).
+// CaptureScreen grabs the primary display and encodes it for the AI (a
+// single instantaneous frame, no settling).
 func CaptureScreen() (Screenshot, error) {
 	img, err := captureImage()
 	if err != nil {
 		return Screenshot{}, err
 	}
-	return encode(img)
+	return encodeScreenshot(img, false)
 }
 
 // --- Screen-settle detection -------------------------------------------
@@ -218,12 +193,13 @@ func changedFraction(a, b []byte) float64 {
 	return float64(changed) / float64(len(a))
 }
 
-// CaptureStableScreen waits for the screen to settle, then returns a PNG of
-// the settled frame. It sleeps `initial` first (to let a load actually
-// begin), then polls every `poll` until two consecutive frames are
-// near-identical, or `maxWait` elapses — whichever comes first. On timeout
-// it returns the most recent frame (best effort) rather than failing.
-func CaptureStableScreen(initial, poll, maxWait time.Duration) (Screenshot, error) {
+// CaptureStableScreen waits for the screen to settle, then returns the
+// settled frame encoded for the AI (downscaled JPEG, or a native PNG when
+// fullRes). It sleeps `initial` first (to let a load actually begin), then
+// polls every `poll` until two consecutive frames are near-identical, or
+// `maxWait` elapses — whichever comes first. On timeout it returns the
+// most recent frame (best effort) rather than failing.
+func CaptureStableScreen(initial, poll, maxWait time.Duration, fullRes bool) (Screenshot, error) {
 	start := time.Now()
 	if initial > 0 {
 		time.Sleep(initial)
@@ -248,10 +224,10 @@ func CaptureStableScreen(initial, poll, maxWait time.Duration) (Screenshot, erro
 		prev = nfp
 		if frac < fpStableFraction {
 			log.Printf("screenshot: screen settled after %v", time.Since(start).Round(time.Millisecond))
-			return encode(img)
+			return encodeScreenshot(img, fullRes)
 		}
 	}
 
 	log.Printf("screenshot: screen did NOT settle within %v (still changing) — capturing anyway", maxWait)
-	return encode(img)
+	return encodeScreenshot(img, fullRes)
 }
