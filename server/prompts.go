@@ -156,7 +156,10 @@ Before acting, check the screen matches what the previous step should have
 produced.
 - Small interruptions (cookie banners, popups, "not now" prompts, tooltips):
   clear them in "actions" and continue. That's still "act".
-- The step is already done on screen: "skip".
+- The step's RESULT is already clearly visible on screen: "skip", and say in
+  "reason" exactly what you see that proves it. Skip is rare: a step that
+  asks you to open, go to, enter, choose or go back is almost never done
+  already — do it. If you're unsure, act.
 - The screen is not what the plan expects, but the task still looks
   achievable (wrong page, dialog you can't safely dismiss, element missing,
   previous step didn't work): "replan", with a short reason.

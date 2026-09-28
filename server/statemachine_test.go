@@ -414,6 +414,27 @@ func TestStateMachine(t *testing.T) {
 			mustEqual(t, "history cleared on the next step", len(task.StepActions), 0)
 		}},
 
+		{"two skips in a row hand back to the planner", func(t *testing.T) {
+			task := running(t, "go back", "open the first cat video", "play it")
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictSkip, true, "results visible"))
+			mustEqual(t, "first skip advances", task.CurrentInstructionIndex, 1)
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictSkip, true, "video open"))
+			mustEqual(t, "second skip doesn't advance", task.CurrentInstructionIndex, 1)
+			mustEqual(t, "replan instead", task.Context, true)
+
+			// Acting in between resets the streak.
+			task = running(t, "a", "b", "c", "d")
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictSkip, true, ""))
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "", click))
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictSkip, true, ""))
+			mustEqual(t, "skip after an act is fine", task.CurrentInstructionIndex, 3)
+		}},
+
 		{"refused CREATE_TASK", func(t *testing.T) {
 			a := create("x")
 			a.Refused = "Add your OpenRouter key in Settings"

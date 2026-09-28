@@ -316,6 +316,7 @@ func applyPlan(t Task, p PlanResult, image string) Task {
 	t.Reason = ""
 	t.InstrAttempts = 0
 	t.StepActions = nil
+	t.SkipStreak = 0
 	t.ExecutionList = make([]Execution, 0)
 	if t.ConfirmedIndex >= idx {
 		// The steps from idx on are new; an approval was for the old ones.
@@ -377,6 +378,7 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 
 	switch res.Verdict {
 	case verdictAct:
+		t.SkipStreak = 0
 		t.ExecutionList = res.Actions
 		if res.InstructionDone {
 			t.CurrentInstructionIndex++
@@ -392,12 +394,28 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 			t.DeviceID, len(res.Actions), t.CurrentInstructionIndex, len(t.InstructionList), res.InstructionDone, res.Actions)
 
 	case verdictSkip:
+		// Skipping advances without doing anything, so the executor's
+		// judgement is all that stands between the plan and the screen.
+		// One skip is fine (the plan can include something already true);
+		// a second in a row, with nothing done in between, means it's
+		// waving steps through — let the planner look instead.
+		if t.SkipStreak >= 1 && t.CurrentInstructionIndex < len(t.InstructionList) {
+			reason := fmt.Sprintf("The executor judged step %d (%q) already done without doing anything, right after skipping the previous step too. Check the screen: those steps may not actually have happened.",
+				t.CurrentInstructionIndex+1, t.InstructionList[t.CurrentInstructionIndex])
+			if res.Reason != "" {
+				reason += " (It said: " + res.Reason + ")"
+			}
+			srvLogf("device=%s: second skip in a row, replanning instead: %s", t.DeviceID, reason)
+			t.SkipStreak = 0
+			return requestReplan(t, reason, image)
+		}
+		t.SkipStreak++
 		t.ExecutionList = make([]Execution, 0)
 		t.CurrentInstructionIndex++
 		t.InstrAttempts = 0
 		t.StepActions = nil
-		srvLogf("device=%s: executor skip: instruction already done on screen, now %d/%d",
-			t.DeviceID, t.CurrentInstructionIndex, len(t.InstructionList))
+		srvLogf("device=%s: executor skip (%s): instruction already done on screen, now %d/%d",
+			t.DeviceID, res.Reason, t.CurrentInstructionIndex, len(t.InstructionList))
 
 	case verdictReplan:
 		srvLogf("device=%s: executor replan: %s", t.DeviceID, res.Reason)
@@ -459,6 +477,7 @@ func requestReplan(t Task, reason, image string) Task {
 	t.Reason = reason
 	t.InstrAttempts = 0
 	t.StepActions = nil
+	t.SkipStreak = 0
 	t.Status = "RUNNING"
 	return t
 }

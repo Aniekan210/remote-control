@@ -42,6 +42,7 @@ type Task struct {
 
 	InstrAttempts int      `json:"-"` // executor calls on the current instruction (capped, then replan)
 	StepActions   []string `json:"-"` // what earlier batches already did for the current instruction (shown to the executor)
+	SkipStreak    int      `json:"-"` // steps skipped in a row with nothing done in between
 	InFlight      bool     `json:"-"` // an AI call for the current Seq is running; further ADVANCEs for it are duplicates
 }
 
