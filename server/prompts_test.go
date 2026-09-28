@@ -53,3 +53,18 @@ func TestLimitToOneClick(t *testing.T) {
 		}
 	}
 }
+
+func TestMentionsFiles(t *testing.T) {
+	yes := []string{"open the file", "Save it to my Downloads folder", "the report.pdf", `C:\Users\me`, "User answered: attach the screenshot"}
+	no := []string{"The search results do not show Blossom's LinkedIn profile.", "a popup is in the way", "User answered: send it without a note"}
+	for _, s := range yes {
+		if !mentionsFiles(s) {
+			t.Errorf("should mention files: %q", s)
+		}
+	}
+	for _, s := range no {
+		if mentionsFiles(s) {
+			t.Errorf("should not mention files: %q", s)
+		}
+	}
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -92,6 +93,9 @@ func (c *costTracker) saveLocked() {
 	data, err := json.Marshal(c)
 	if err != nil {
 		return
+	}
+	if dir := filepath.Dir(c.path); dir != "." {
+		_ = os.MkdirAll(dir, 0o755)
 	}
 	tmp := c.path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {

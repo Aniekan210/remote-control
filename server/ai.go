@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -342,21 +343,14 @@ func reviseUserText(task Task, files []FileEntry, now time.Time) string {
 
 // mentionsFiles is a cheap check for whether a replan reason or an answer
 // is about files or folders — only then is the filesystem list (the
-// biggest part of a planning prompt) worth sending on a revise.
+// biggest part of a planning prompt) worth sending on a revise. It matches
+// whole words, so "profile" doesn't count as "file".
 func mentionsFiles(text string) bool {
-	t := strings.ToLower(text)
-	for _, w := range []string{
-		"file", "folder", "directory", "document", "download", "desktop",
-		"pictures", "photo", "screenshot", "attachment", "attach", "upload",
-		"save", "saved", "path", "drive", "explorer", "~\\", ":\\",
-		".pdf", ".doc", ".xls", ".ppt", ".txt", ".csv", ".png", ".jpg", ".jpeg", ".zip", ".mp3", ".mp4",
-	} {
-		if strings.Contains(t, w) {
-			return true
-		}
-	}
-	return false
+	return fileWords.MatchString(text)
 }
+
+var fileWords = regexp.MustCompile(`(?i)\b(files?|folders?|director(y|ies)|documents?|downloads?|desktop|pictures|photos?|screenshots?|attach(ed|ment|ments)?|upload(ed|s)?|saved?|explorer)\b` +
+	`|\.(pdf|docx?|xlsx?|pptx?|txt|csv|png|jpe?g|zip|mp3|mp4)\b|[a-z]:\\|~\\`)
 
 // callExecutor asks the executor for the physical actions that carry out
 // the current instruction.

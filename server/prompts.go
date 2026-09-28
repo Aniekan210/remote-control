@@ -95,6 +95,10 @@ completed steps, the remaining steps, why it's being revised, and the user's
 answers. Plan from the current screenshot and follow the answers. Return
 ONLY the steps still to do — never repeat completed ones. You may change,
 drop or add steps (fix-ups, or e.g. "Send the invite without a note.").
+The approach in the completed steps just failed — do NOT plan it again.
+Work from what's on screen now and try something different: a filter or tab
+(e.g. "People"), scrolling, a more specific search, another route. If you
+can't see a different approach that could work, use "ask".
 
 OUTPUT
 Only JSON, no prose, no code fences:
@@ -314,6 +318,12 @@ KEYBOARD RULES
 - Prefer keyboard for launching/switching/closing apps and for text entry;
   prefer mouse for clicking specific on-screen targets (links, buttons,
   fields).
+- In a web browser, ALWAYS use these shortcuts instead of clicking — they
+  work in every browser and never miss:
+    {CTRL+T} new tab          {CTRL+W} close tab     {CTRL+TAB} next tab
+    {CTRL+L} focus the address bar (then type the URL and {ENTER})
+    {ALT+LEFT} back           {F5} reload            {CTRL+F} find on page
+  e.g. "Go to linkedin.com." = {CTRL+L}, "linkedin.com", {ENTER}.
 
 ────────────────────────────────────────
 EXAMPLES
