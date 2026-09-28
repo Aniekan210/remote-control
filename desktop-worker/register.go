@@ -25,7 +25,7 @@ func RegisterRoom(httpAddr, deviceID string) error {
 		return err
 	}
 
-	url := fmt.Sprintf("http://%s/rooms", httpAddr)
+	url := fmt.Sprintf("https://%s/rooms", httpAddr)
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	var lastErr error
