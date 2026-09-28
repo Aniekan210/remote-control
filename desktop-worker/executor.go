@@ -127,6 +127,13 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 			continue
 		}
 
+		// A brand-new task: screenshots and clicks only cover the primary
+		// monitor, so bring the window the user is working in onto it
+		// before the first screenshot is taken.
+		if cur.Context && len(cur.InstructionList) == 0 && cur.Reason == "" {
+			ensureForegroundOnPrimary()
+		}
+
 		// Our turn to ask for the next step. The filesystem snapshot is
 		// attached whenever Context is true (a plan or a revise is next).
 		sendAdvance(state, deviceID, cur.Context, fsQuery(cur), fsStore, "", cur.Seq)
