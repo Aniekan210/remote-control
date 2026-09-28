@@ -159,6 +159,13 @@ func main() {
 		go RunOverlay(overlayUpdates, overlayDone)
 	} else {
 		log.Println("overlay disabled via REMOTE_WORKER_NO_OVERLAY=1")
+		// Nothing else reads overlayUpdates, and the executor's sends to it
+		// block once its buffer is full — without a reader the worker
+		// would stop running tasks after a handful of updates.
+		go func() {
+			for range overlayUpdates {
+			}
+		}()
 	}
 
 	// Human-takeover pause: moving the physical mouse pauses automation (see
