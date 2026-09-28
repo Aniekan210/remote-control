@@ -60,6 +60,12 @@ func initDB() {
 		srvLogf("ERROR: DATABASE_URL can't be parsed (%v) — no task can start. It should be the bare Neon connection string: postgresql://user:password@ep-....neon.tech/neondb?sslmode=require", err)
 		return
 	}
+	// Neon's connection strings end with channel_binding=require, which
+	// this pgx version doesn't implement: it would pass it on to the server
+	// as a session setting, and the server rejects the connection over it.
+	// sslmode=require still encrypts the connection.
+	delete(cfg.ConnConfig.RuntimeParams, "channel_binding")
+
 	host, database := cfg.ConnConfig.Host, cfg.ConnConfig.Database
 	if host == "" || strings.HasPrefix(host, "/") || database == "" {
 		// What an empty or mangled value parses to: the driver's defaults,
