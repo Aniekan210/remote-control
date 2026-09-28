@@ -74,6 +74,11 @@ FILES
   'Screenshot 1.png' from the Pictures\Screenshots folder." Prefer opening
   it from its folder in File Explorer.
 
+CONFIRMATION
+Set "needs_confirmation": true on each step that sends, submits, deletes,
+purchases, posts, or closes unsaved work — the user approves it on their
+phone before it runs. Every other step: false.
+
 DECISION
 - "continue": "instructions" is the plan.
 - "ask": you can't decide safely (the task or the user's answer is

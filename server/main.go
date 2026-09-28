@@ -313,6 +313,16 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			// Irreversible steps (send, submit, delete, purchase, post,
+			// close unsaved work) wait for the user's approval before the
+			// executor even looks at them. No AI call for the question.
+			if needsConfirmation(task) {
+				step := task.InstructionList[task.CurrentInstructionIndex]
+				srvLogf("device=%s: step %d needs approval before it runs: %q", taskID, task.CurrentInstructionIndex+1, step)
+				task = askUser(task, "confirm", "About to: "+step, screenshotDataURL(action.ScreenshotPayload))
+				break
+			}
+
 			// Per-task caps: a runaway task (looping, or just long) stops
 			// spending before the next call. Hitting a cap doesn't fail the
 			// task — it becomes a budget question, and answering it grants
@@ -620,12 +630,26 @@ func askUser(t Task, kind, question, image string) Task {
 	return t
 }
 
+// needsConfirmation reports whether the current step is flagged as
+// irreversible and hasn't been approved yet.
+func needsConfirmation(t Task) bool {
+	idx := t.CurrentInstructionIndex
+	return !t.Context && idx >= 0 && idx < len(t.InstructionList) &&
+		idx < len(t.NeedsConfirm) && t.NeedsConfirm[idx] && t.ConfirmedIndex != idx
+}
+
+// approveAnswer is what the Approve button sends for a confirm question.
+const approveAnswer = "approve"
+
 // applyAnswer resumes a NEEDS_INPUT task with the user's answer:
+//   - confirm + "approve": the step is approved (ConfirmedIndex) and runs
+//     next — plain ADVANCE, executor call, no planner call
 //   - budget: any answer means "continue" — the per-task counters start a
 //     fresh window and the task carries on where it was, no planner call
 //     (Context keeps its value, so a plan that was about to be made still
 //     gets made)
-//   - blocked (and anything else): the answer is recorded and the planner
+//   - blocked, or confirm with any other text ("do something else
+//     instead"): the answer is recorded and the planner
 //     revises the plan with it — Reason set, Context=true, so the worker
 //     sends a context ADVANCE. This doesn't count as an automatic revise.
 func applyAnswer(t Task, answer string, now time.Time) Task {
@@ -638,8 +662,13 @@ func applyAnswer(t Task, answer string, now time.Time) Task {
 	t.ExecutionList = make([]Execution, 0)
 	t.Status = "RUNNING"
 
-	switch kind {
-	case "budget":
+	switch {
+	case kind == "confirm" && strings.EqualFold(answer, approveAnswer):
+		t.ConfirmedIndex = t.CurrentInstructionIndex
+		t.Context = false
+		srvLogf("device=%s: step %d approved by the user", t.DeviceID, t.CurrentInstructionIndex+1)
+
+	case kind == "budget":
 		t.AICalls = 0
 		t.PlannerCalls = 0
 		t.CostBase = t.CostUSD
