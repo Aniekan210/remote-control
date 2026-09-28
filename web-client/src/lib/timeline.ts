@@ -1,4 +1,4 @@
-import type { ClientAction, Execution, Task, TaskStatus } from "./task";
+import type { ClientAction, Execution, QuestionKind, Task, TaskStatus } from "./task";
 
 /**
  * The Go server only ever broadcasts the CURRENT task snapshot, and it
@@ -13,6 +13,8 @@ import type { ClientAction, Execution, Task, TaskStatus } from "./task";
  *  - execution ADVANCE      → ExecutionList = actions for step[index], then index++
  *                             so after it lands, step[index-1] owns ExecutionList
  *  - index >= len(steps)    → COMPLETED
+ *  - stuck / step to approve / cap reached → NEEDS_INPUT with a question,
+ *    until an ANSWER sends it back to RUNNING
  *  - CANCEL / give-up reset → NONE
  */
 
@@ -27,7 +29,15 @@ export type StepRecord = {
   actions: Execution[];
 };
 
-export type Mark = { kind: "paused" | "resumed"; at: number; byYou: boolean; afterStep: number };
+export type Mark = {
+  kind: "paused" | "resumed" | "question" | "answer";
+  at: number;
+  byYou: boolean;
+  afterStep: number;
+  /** the question asked, or the answer given */
+  text?: string;
+  questionKind?: QuestionKind | "";
+};
 
 /** completed = all steps done · cancelled = you cancelled · ended = reset by someone/something else */
 export type Outcome = "completed" | "cancelled" | "ended";
@@ -47,6 +57,8 @@ export type Timeline = {
   joinedLate: boolean;
   /** OpenRouter spend on this task so far, in USD (from the server) */
   costUsd?: number;
+  /** how many answers the server had recorded at the last snapshot */
+  answerCount?: number;
 };
 
 export type TimelineStore = { current: Timeline | null; last: Timeline | null };
@@ -126,6 +138,29 @@ export function reduceTimeline(store: TimelineStore, snap: Task, now: number, in
     marks.push({ kind: "resumed", at: now, byYou: byYou("RESUME_TASK"), afterStep: active });
   }
 
+  // ── Questions and answers ─────────────────────────────────────
+  if (cur.status !== "NEEDS_INPUT" && snap.status === "NEEDS_INPUT") {
+    marks.push({
+      kind: "question",
+      at: now,
+      byYou: false,
+      afterStep: active,
+      text: snap.question,
+      questionKind: snap.questionKind,
+    });
+  } else if (cur.status === "NEEDS_INPUT" && snap.status !== "NEEDS_INPUT") {
+    const asked = [...marks].reverse().find((m) => m.kind === "question");
+    const newAnswer = snap.answers.length > (cur.answerCount ?? 0) ? snap.answers[snap.answers.length - 1] : null;
+    const text = newAnswer
+      ? (newAnswer.split(" / A: ").pop() ?? newAnswer)
+      : asked?.questionKind === "confirm"
+        ? "Approved"
+        : asked?.questionKind === "budget"
+          ? "Continue"
+          : "Answered";
+    marks.push({ kind: "answer", at: now, byYou: byYou("ANSWER"), afterStep: active, text });
+  }
+
   // ── Finished ──────────────────────────────────────────────────
   let { outcome, endedAt } = cur;
   if (snap.status === "COMPLETED" && !outcome) {
@@ -146,6 +181,7 @@ export function reduceTimeline(store: TimelineStore, snap: Task, now: number, in
       endedAt,
       lastIndex: idx,
       costUsd: Math.max(cur.costUsd ?? 0, snap.costUsd),
+      answerCount: snap.answers.length,
     },
   };
 }

@@ -117,7 +117,7 @@ var (
 // statusColor picks the border glow color for a given status.
 func statusColor(status string) uint32 {
 	switch status {
-	case "PAUSED":
+	case "PAUSED", "NEEDS_INPUT":
 		return colorAmber
 	case "COMPLETED":
 		return colorGreen

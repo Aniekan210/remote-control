@@ -7,7 +7,7 @@ const pad = (n: number) => String(n).padStart(2, "0");
 export function TaskSummary({ t, now }: { t: Timeline; now: number }) {
   const total = t.steps.length;
   const done = t.outcome === "completed";
-  const paused = t.status === "PAUSED";
+  const paused = t.status === "PAUSED" || t.status === "NEEDS_INPUT";
   const planning = total === 0 && !t.outcome;
   const active = activeStepIndex(t);
   const elapsed = (t.endedAt ?? now) - t.startedAt;

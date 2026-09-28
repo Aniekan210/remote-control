@@ -4,7 +4,7 @@
  * Once you know the real shape, you can delete the fallbacks.
  */
 
-export type TaskStatus = "NONE" | "RUNNING" | "PAUSED" | "COMPLETED";
+export type TaskStatus = "NONE" | "RUNNING" | "PAUSED" | "NEEDS_INPUT" | "COMPLETED";
 
 export type Execution = Record<string, unknown>;
 
@@ -71,7 +71,7 @@ function pick(o: Obj, ...keys: string[]): unknown {
   return undefined;
 }
 
-const STATUSES: TaskStatus[] = ["NONE", "RUNNING", "PAUSED", "COMPLETED"];
+const STATUSES: TaskStatus[] = ["NONE", "RUNNING", "PAUSED", "NEEDS_INPUT", "COMPLETED"];
 const QUESTION_KINDS: QuestionKind[] = ["blocked", "confirm", "budget"];
 
 export function normalizeTask(raw: unknown): Task {
@@ -125,4 +125,6 @@ export type ClientAction =
   | { type: "CREATE_TASK"; description: string }
   | { type: "PAUSE_TASK" }
   | { type: "RESUME_TASK" }
-  | { type: "CANCEL_TASK" };
+  | { type: "CANCEL_TASK" }
+  /** reply to the current question (NEEDS_INPUT); "approve" approves a confirm question */
+  | { type: "ANSWER"; description: string };

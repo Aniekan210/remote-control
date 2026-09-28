@@ -69,8 +69,8 @@ type TaskChange struct {
 // Chrome." — instead of just a static status word.
 type OverlayState struct {
 	Visible bool
-	// Status is "RUNNING", "PAUSED", or "COMPLETED" — drives the status
-	// dot color and the small label text.
+	// Status is "RUNNING", "PAUSED", "NEEDS_INPUT" or "COMPLETED" — drives
+	// the border color (NEEDS_INPUT shows amber, like PAUSED).
 	Status string
 	// TaskDescription is the overall goal the user typed ("open chrome and
 	// search for cats") — shown small/muted for context above the current

@@ -263,6 +263,26 @@ func overlayStateFor(t Task) OverlayState {
 			StepTotal:       total,
 		}
 
+	case "NEEDS_INPUT":
+		// The server is waiting on the user's answer (a blocker, a step to
+		// approve, or a budget question). The worker idles until it comes.
+		total := len(t.InstructionList)
+		idx := t.CurrentInstructionIndex
+		stepText := "Waiting for you on your phone"
+		stepIndex := 0
+		if idx >= 0 && idx < total {
+			stepText = "Waiting for you on your phone — " + t.InstructionList[idx]
+			stepIndex = idx + 1
+		}
+		return OverlayState{
+			Visible:         true,
+			Status:          "NEEDS_INPUT",
+			TaskDescription: t.Description,
+			StepText:        stepText,
+			StepIndex:       stepIndex,
+			StepTotal:       total,
+		}
+
 	case "COMPLETED":
 		total := len(t.InstructionList)
 		return OverlayState{

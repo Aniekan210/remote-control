@@ -12,7 +12,7 @@ type StateUpdate struct {
 type Task struct {
 	DeviceID                string      `json:"device_id"`
 	Description             string      `json:"description"`
-	Status                  string      `json:"status"` // RUNNING / COMPLETED / PAUSED / CANCELLED / NONE
+	Status                  string      `json:"status"` // RUNNING / NEEDS_INPUT / COMPLETED / PAUSED / CANCELLED / NONE
 	CurrentInstructionIndex int         `json:"current_instruction_index"`
 	InstructionList         []string    `json:"instruction_list"`
 	ExecutionList           []Execution `json:"execution_list"`

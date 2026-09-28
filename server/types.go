@@ -16,7 +16,7 @@ type RoomRequest struct {
 type Task struct {
 	DeviceID                string      `json:"device_id"`
 	Description             string      `json:"description"` // the task the user said
-	Status                  string      `json:"status"`      // RUNNING / COMPLETED / PAUSED / CANCELLED / NONE
+	Status                  string      `json:"status"`      // RUNNING / NEEDS_INPUT / COMPLETED / PAUSED / CANCELLED / NONE
 	CurrentInstructionIndex int         `json:"current_instruction_index"`
 	InstructionList         []string    `json:"instruction_list"` // list of instructions from initial AI breakdown
 	ExecutionList           []Execution `json:"execution_list"`   // list of executions after AI solves singular instruction
