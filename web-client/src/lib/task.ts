@@ -17,6 +17,8 @@ export type Task = {
   executionList: Execution[];
   /** true while the AI is planning (instruction list not generated yet) */
   planning: boolean;
+  /** OpenRouter spend on this task so far, in USD */
+  costUsd: number;
 };
 
 export const EMPTY_TASK: Task = {
@@ -27,6 +29,7 @@ export const EMPTY_TASK: Task = {
   instructionList: [],
   executionList: [],
   planning: false,
+  costUsd: 0,
 };
 
 type Obj = Record<string, unknown>;
@@ -56,6 +59,7 @@ export function normalizeTask(raw: unknown): Task {
       ? executions.map((e) => (e && typeof e === "object" ? (e as Execution) : { value: e }))
       : [],
     planning: Boolean(pick(o, "Context", "context")),
+    costUsd: Number(pick(o, "CostUSD", "costUsd", "cost_usd") ?? 0) || 0,
   };
 }
 

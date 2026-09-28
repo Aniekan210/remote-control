@@ -18,6 +18,7 @@ type Task struct {
 	InstructionList         []string    `json:"instruction_list"` // list of instructions from initial AI breakdown
 	ExecutionList           []Execution `json:"execution_list"`   // list of executions after AI solves singular instruction
 	Context                 bool        `json:"context"`          // boolean asking for context from the desktop worker
+	CostUSD                 float64     `json:"cost_usd"`         // total OpenRouter spend on this task so far
 }
 
 type Execution struct {

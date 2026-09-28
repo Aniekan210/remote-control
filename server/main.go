@@ -221,11 +221,14 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 
 			var result any
 			var sendErr error
+			var callCost float64
 
 			const maxRetries = 3
 			for attempt := 1; attempt <= maxRetries; attempt++ {
 				callStart := time.Now()
-				result, sendErr = sendMessage(task, action)
+				var attemptCost float64
+				result, attemptCost, sendErr = sendMessage(task, action)
+				callCost += attemptCost
 				callElapsed := time.Since(callStart)
 
 				if sendErr == nil {
@@ -248,6 +251,12 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			// ADVANCE from a different client in the room) may have landed
 			// while we were waiting on the network call.
 			task = taskHashTable[taskID]
+
+			// Charge the call to the task, unless it was cancelled while the
+			// call was in flight (a reset task starts again from $0).
+			if task.Status != "NONE" {
+				task.CostUSD += callCost
+			}
 
 			switch {
 			case sendErr != nil:

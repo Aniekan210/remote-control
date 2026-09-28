@@ -1,4 +1,4 @@
-import { activeStepIndex, fmtDuration, type Timeline } from "@/lib/timeline";
+import { activeStepIndex, fmtCost, fmtDuration, type Timeline } from "@/lib/timeline";
 import { StatusBadge } from "./status";
 
 const pad = (n: number) => String(n).padStart(2, "0");
@@ -19,6 +19,7 @@ export function TaskSummary({ t, now }: { t: Timeline; now: number }) {
           <StatusBadge status={t.status} planning={planning} />
           <span className="flex items-center gap-3 font-mono text-[11px] tabular-nums text-dim">
             {total > 0 && <span>{done ? `${pad(total)}/${pad(total)}` : `${pad(active + 1)}/${pad(total)}`}</span>}
+            {(t.costUsd ?? 0) > 0 && <span className="text-faint">{fmtCost(t.costUsd ?? 0)}</span>}
             <span className="text-faint">{fmtDuration(elapsed)}</span>
           </span>
         </div>

@@ -45,6 +45,8 @@ export type Timeline = {
   marks: Mark[];
   /** true when this phone opened mid-task, so earlier history wasn't observed */
   joinedLate: boolean;
+  /** OpenRouter spend on this task so far, in USD (from the server) */
+  costUsd?: number;
 };
 
 export type TimelineStore = { current: Timeline | null; last: Timeline | null };
@@ -143,6 +145,7 @@ export function reduceTimeline(store: TimelineStore, snap: Task, now: number, in
       outcome,
       endedAt,
       lastIndex: idx,
+      costUsd: Math.max(cur.costUsd ?? 0, snap.costUsd),
     },
   };
 }
@@ -188,6 +191,12 @@ export function fmtDuration(ms: number): string {
   const m = Math.floor(s / 60);
   if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
   return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+/** "$0.012" — enough precision to see per-task spend in cents. */
+export function fmtCost(usd: number): string {
+  if (usd <= 0) return "$0";
+  return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(3)}`;
 }
 
 export function fmtClock(ts: number): string {

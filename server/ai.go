@@ -53,7 +53,10 @@ func modelForContext(planning bool) string {
 	return defaultExecutionModel
 }
 
-func sendMessage(task Task, action Action) (any, error) {
+// sendMessage makes one AI call for the task's current phase and returns
+// the parsed result plus what OpenRouter says the call cost in USD (0 when
+// the call never got a usable response).
+func sendMessage(task Task, action Action) (any, float64, error) {
 	// callID ties every log line for this one call together, so concurrent
 	// tasks' logs don't get interleaved into something unreadable — grep
 	// for the same callID to follow one call start-to-finish.
@@ -228,7 +231,7 @@ no markdown code fences:
 		fs, err := json.Marshal(action.FileSystemPayload)
 		if err != nil {
 			aiLogf("[%s] FAILED marshal filesystem payload: %v", callID, err)
-			return nil, fmt.Errorf("marshal filesystem payload: %w", err)
+			return nil, 0, fmt.Errorf("marshal filesystem payload: %w", err)
 		}
 
 		// The task description lives on the Task (set at CREATE_TASK), NOT on
@@ -253,7 +256,7 @@ no markdown code fences:
 			task.CurrentInstructionIndex >= len(task.InstructionList) {
 			aiLogf("[%s] FAILED instruction index %d out of range (list has %d items): %v",
 				callID, task.CurrentInstructionIndex, len(task.InstructionList), task.InstructionList)
-			return nil, fmt.Errorf(
+			return nil, 0, fmt.Errorf(
 				"instruction index %d out of range (list has %d items)",
 				task.CurrentInstructionIndex, len(task.InstructionList),
 			)
@@ -496,12 +499,15 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 		"response_format": map[string]any{
 			"type": "json_object",
 		},
+		// Makes OpenRouter return the call's real cost (usage.cost, in
+		// USD) alongside the token counts, so every call can be priced.
+		"usage": map[string]any{"include": true},
 	}
 
 	body, err := json.Marshal(requestBody)
 	if err != nil {
 		aiLogf("[%s] FAILED marshal request body: %v", callID, err)
-		return nil, fmt.Errorf("marshal request body: %w", err)
+		return nil, 0, fmt.Errorf("marshal request body: %w", err)
 	}
 
 	apiKey := os.Getenv("OPENROUTER_API_KEY")
@@ -525,7 +531,7 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 	)
 	if err != nil {
 		aiLogf("[%s] FAILED build request: %v", callID, err)
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, 0, fmt.Errorf("build request: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -541,7 +547,7 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 		// above) — NOT for HTTP error status codes, which are handled
 		// below once we have a response to read.
 		aiLogf("[%s] FAILED request after %s: %v", callID, elapsed, err)
-		return nil, fmt.Errorf("openrouter request failed: %w", err)
+		return nil, 0, fmt.Errorf("openrouter request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -550,7 +556,7 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 	rawBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		aiLogf("[%s] FAILED read response body: %v", callID, err)
-		return nil, fmt.Errorf("read response body: %w", err)
+		return nil, 0, fmt.Errorf("read response body: %w", err)
 	}
 
 	// Check status BEFORE trying to decode into the success shape, so
@@ -558,7 +564,7 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 	// JSON parse error.
 	if resp.StatusCode != http.StatusOK {
 		aiLogf("[%s] FAILED OpenRouter status %d, body: %s", callID, resp.StatusCode, string(rawBody))
-		return nil, fmt.Errorf(
+		return nil, 0, fmt.Errorf(
 			"OpenRouter returned status %d: %s",
 			resp.StatusCode, string(rawBody),
 		)
@@ -570,27 +576,34 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
-		// Usage isn't used for any logic, but logging it costs nothing and
-		// is the fastest way to notice "the model saw 0 image tokens" type
-		// problems (e.g. a malformed image URL the provider silently drops).
+		// Usage is logged on every call (the fastest way to notice "the
+		// model saw 0 image tokens" type problems) and, since the request
+		// sets usage.include, carries the call's cost in USD.
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
+			PromptTokens            int     `json:"prompt_tokens"`
+			CompletionTokens        int     `json:"completion_tokens"`
+			TotalTokens             int     `json:"total_tokens"`
+			Cost                    float64 `json:"cost"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
 		} `json:"usage"`
 	}
 
 	if err := json.Unmarshal(rawBody, &result); err != nil {
 		aiLogf("[%s] FAILED decode openrouter response: %v, raw body: %s", callID, err, string(rawBody))
-		return nil, fmt.Errorf("decode openrouter response: %w (body: %s)", err, string(rawBody))
+		return nil, 0, fmt.Errorf("decode openrouter response: %w (body: %s)", err, string(rawBody))
 	}
 
-	aiLogf("[%s] usage: promptTokens=%d completionTokens=%d totalTokens=%d",
-		callID, result.Usage.PromptTokens, result.Usage.CompletionTokens, result.Usage.TotalTokens)
+	cost := result.Usage.Cost
+	day, month := costs.add(cost)
+	aiLogf("[%s] usage: mode=%s model=%s promptTokens=%d completionTokens=%d reasoningTokens=%d totalTokens=%d cost=$%.5f | today=$%.4f month=$%.4f",
+		callID, mode, model, result.Usage.PromptTokens, result.Usage.CompletionTokens,
+		result.Usage.CompletionTokensDetails.ReasoningTokens, result.Usage.TotalTokens, cost, day, month)
 
 	if len(result.Choices) == 0 {
 		aiLogf("[%s] FAILED no choices in response, raw body: %s", callID, string(rawBody))
-		return nil, fmt.Errorf("no model response (body: %s)", string(rawBody))
+		return nil, cost, fmt.Errorf("no model response (body: %s)", string(rawBody))
 	}
 
 	rawContent := result.Choices[0].Message.Content
@@ -605,11 +618,11 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 		instructions, err := parseInstructionList(response)
 		if err != nil {
 			aiLogf("[%s] FAILED invalid instruction list: %v, cleaned response: %s", callID, err, response)
-			return nil, fmt.Errorf("invalid instruction list: %w (raw: %s)", err, response)
+			return nil, cost, fmt.Errorf("invalid instruction list: %w (raw: %s)", err, response)
 		}
 
 		aiLogf("[%s] SUCCESS planning: %d instructions: %v", callID, len(instructions), instructions)
-		return instructions, nil
+		return instructions, cost, nil
 	}
 
 	var executions struct {
@@ -618,7 +631,7 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 
 	if err := json.Unmarshal([]byte(response), &executions); err != nil {
 		aiLogf("[%s] FAILED invalid execution list: %v, cleaned response: %s", callID, err, response)
-		return nil, fmt.Errorf("invalid execution list: %w (raw: %s)", err, response)
+		return nil, cost, fmt.Errorf("invalid execution list: %w (raw: %s)", err, response)
 	}
 
 	// Validate the decoded actions. This is the safety net for the failure
@@ -631,7 +644,7 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 	// worker a list of no-op clicks at (0,0).
 	if len(executions.Response) == 0 {
 		aiLogf("[%s] FAILED model returned an empty execution list, cleaned response: %s", callID, response)
-		return nil, fmt.Errorf("empty execution list (raw: %s)", response)
+		return nil, cost, fmt.Errorf("empty execution list (raw: %s)", response)
 	}
 	for i, e := range executions.Response {
 		switch e.Type {
@@ -640,13 +653,13 @@ Return ONLY the JSON object, with no surrounding prose and no markdown code fenc
 		default:
 			aiLogf("[%s] FAILED execution %d has invalid/empty type %q — the model almost certainly used the wrong JSON field names (expected type/mouse_pos_x/mouse_pos_y/key_string/mouse_hold); cleaned response: %s",
 				callID, i, e.Type, response)
-			return nil, fmt.Errorf("execution %d has invalid/empty type %q (raw: %s)", i, e.Type, response)
+			return nil, cost, fmt.Errorf("execution %d has invalid/empty type %q (raw: %s)", i, e.Type, response)
 		}
 	}
 
 	aiLogf("[%s] SUCCESS execution: %d actions: %+v", callID, len(executions.Response), executions.Response)
 
-	return executions.Response, nil
+	return executions.Response, cost, nil
 }
 
 // parseInstructionList extracts the planner's list of instructions from
