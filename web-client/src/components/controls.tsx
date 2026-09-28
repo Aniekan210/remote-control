@@ -26,10 +26,12 @@ export function Controls({
   }, [armed]);
 
   const paused = status === "PAUSED";
+  // While the task waits on your answer there's nothing running to pause.
+  const waiting = status === "NEEDS_INPUT";
 
   return (
-    <div className="grid grid-cols-2 gap-2">
-      {paused ? (
+    <div className={`grid gap-2 ${waiting ? "grid-cols-1" : "grid-cols-2"}`}>
+      {waiting ? null : paused ? (
         <button
           onClick={onResume}
           disabled={busy}

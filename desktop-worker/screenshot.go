@@ -3,10 +3,8 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"image"
-	"image/png"
 	"log"
 	"time"
 	"unsafe"
@@ -57,7 +55,7 @@ type bitmapInfoHeader struct {
 }
 
 // captureImage grabs the primary display into an *image.RGBA. This is the
-// raw capture; PNG encoding and stability polling are layered on top.
+// raw capture; encoding (scaling.go) and stability polling are layered on top.
 func captureImage() (*image.RGBA, error) {
 	width, _, _ := procGetSystemMetrics.Call(uintptr(smCxScreen))
 	height, _, _ := procGetSystemMetrics.Call(uintptr(smCyScreen))
@@ -127,29 +125,14 @@ func captureImage() (*image.RGBA, error) {
 	return img, nil
 }
 
-// encode wraps an *image.RGBA as a PNG Screenshot payload.
-func encode(img *image.RGBA) (Screenshot, error) {
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return Screenshot{}, err
-	}
-	b := img.Bounds()
-	return Screenshot{
-		Format: "png",
-		Width:  uint32(b.Dx()),
-		Height: uint32(b.Dy()),
-		Data:   buf.Bytes(),
-	}, nil
-}
-
-// CaptureScreen grabs the primary display and encodes it as PNG (a single
-// instantaneous frame, no settling).
+// CaptureScreen grabs the primary display and encodes it for the AI (a
+// single instantaneous frame, no settling).
 func CaptureScreen() (Screenshot, error) {
 	img, err := captureImage()
 	if err != nil {
 		return Screenshot{}, err
 	}
-	return encode(img)
+	return encodeScreenshot(img, false)
 }
 
 // --- Screen-settle detection -------------------------------------------
@@ -210,12 +193,34 @@ func changedFraction(a, b []byte) float64 {
 	return float64(changed) / float64(len(a))
 }
 
-// CaptureStableScreen waits for the screen to settle, then returns a PNG of
-// the settled frame. It sleeps `initial` first (to let a load actually
-// begin), then polls every `poll` until two consecutive frames are
-// near-identical, or `maxWait` elapses — whichever comes first. On timeout
-// it returns the most recent frame (best effort) rather than failing.
-func CaptureStableScreen(initial, poll, maxWait time.Duration) (Screenshot, error) {
+// CaptureStableScreen waits for the screen to settle, then returns the
+// settled frame encoded for the AI (downscaled JPEG, or a native PNG when
+// fullRes). It sleeps `initial` first (to let a load actually begin), then
+// polls every `poll` until two consecutive frames are near-identical, or
+// `maxWait` elapses — whichever comes first. On timeout it returns the
+// most recent frame (best effort) rather than failing.
+func CaptureStableScreen(initial, poll, maxWait time.Duration, fullRes bool) (Screenshot, error) {
+	img, err := waitForStableFrame(initial, poll, maxWait)
+	if err != nil {
+		return Screenshot{}, err
+	}
+	return encodeScreenshot(img, fullRes)
+}
+
+// WaitForStableScreen blocks until the screen stops changing (or maxWait
+// passes), without capturing anything for the AI. Used between actions in
+// one list, e.g. after {WIN} so the Start menu is open before typing.
+func WaitForStableScreen(initial, poll, maxWait time.Duration) {
+	if _, err := waitForStableFrame(initial, poll, maxWait); err != nil {
+		// Can't watch the screen: fall back to just waiting a moment.
+		time.Sleep(initial + poll)
+	}
+}
+
+// waitForStableFrame is the settle loop shared by CaptureStableScreen and
+// WaitForStableScreen: it returns the first frame that is near-identical
+// to the one before it, or the latest frame once maxWait has passed.
+func waitForStableFrame(initial, poll, maxWait time.Duration) (*image.RGBA, error) {
 	start := time.Now()
 	if initial > 0 {
 		time.Sleep(initial)
@@ -223,7 +228,7 @@ func CaptureStableScreen(initial, poll, maxWait time.Duration) (Screenshot, erro
 
 	img, err := captureImage()
 	if err != nil {
-		return Screenshot{}, err
+		return nil, err
 	}
 	prev := fingerprint(img)
 
@@ -240,10 +245,10 @@ func CaptureStableScreen(initial, poll, maxWait time.Duration) (Screenshot, erro
 		prev = nfp
 		if frac < fpStableFraction {
 			log.Printf("screenshot: screen settled after %v", time.Since(start).Round(time.Millisecond))
-			return encode(img)
+			return img, nil
 		}
 	}
 
-	log.Printf("screenshot: screen did NOT settle within %v (still changing) — capturing anyway", maxWait)
-	return encode(img)
+	log.Printf("screenshot: screen did NOT settle within %v (still changing) — going ahead anyway", maxWait)
+	return img, nil
 }

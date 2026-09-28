@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Composer } from "./composer";
 import { Controls } from "./controls";
+import { QuestionCard } from "./question-card";
 import { ConnectionDot } from "./status";
 import { Transcript } from "./transcript";
 import { TaskSummary } from "./task-summary";
@@ -31,6 +32,7 @@ const ALLOWED: Record<TaskStatus, ClientAction["type"][]> = {
   NONE: ["CREATE_TASK"],
   RUNNING: ["PAUSE_TASK", "CANCEL_TASK"],
   PAUSED: ["RESUME_TASK", "CANCEL_TASK"],
+  NEEDS_INPUT: ["ANSWER", "CANCEL_TASK"],
   COMPLETED: ["CANCEL_TASK"], // clears the finished task so a new one can start
 };
 
@@ -97,6 +99,21 @@ export function Console({ deviceId, deviceLabel }: { deviceId: string; deviceLab
 
   const showTranscript = status !== null && status !== "NONE" && current;
 
+  // ── Ping the phone when the task starts waiting on you ────────
+  // Only if notifications were already allowed; this never prompts.
+  const question = status === "NEEDS_INPUT" ? task?.question ?? "" : null;
+  useEffect(() => {
+    if (question === null || typeof window === "undefined") return;
+    try {
+      navigator.vibrate?.([120, 80, 120]);
+      if ("Notification" in window && Notification.permission === "granted" && document.hidden) {
+        new Notification("Remote Control needs you", { body: question || "Your task is waiting for an answer." });
+      }
+    } catch {
+      /* notifications are best effort */
+    }
+  }, [question]);
+
   return (
     <div className="flex min-h-dvh flex-col">
       <TopBar
@@ -104,7 +121,9 @@ export function Console({ deviceId, deviceLabel }: { deviceId: string; deviceLab
         below={showTranscript ? <TaskSummary t={current} now={now} /> : undefined}
       />
 
-      <main className="mx-auto w-full max-w-xl flex-1 px-4 pt-6 pb-48">
+      <main
+        className={`mx-auto w-full max-w-xl flex-1 px-4 pt-6 ${status === "NEEDS_INPUT" ? "pb-[26rem]" : "pb-48"}`}
+      >
         <div className="mb-8 flex items-center gap-2 text-dim">
           <IconMonitor width={14} height={14} />
           <span className="truncate font-mono text-[11px] uppercase tracking-[0.08em]">{deviceLabel}</span>
@@ -125,6 +144,12 @@ export function Console({ deviceId, deviceLabel }: { deviceId: string; deviceLab
       {status && (
         <div className="pb-safe fixed inset-x-0 bottom-0 z-20 bg-gradient-to-t from-ink via-ink to-ink/0 pt-8">
           <div className="mx-auto max-w-xl px-4">
+            {task?.lastError && (
+              <p role="alert" className="mb-2 px-1 font-mono text-[12px] leading-snug text-danger">
+                {task.lastError}
+              </p>
+            )}
+
             {status === "NONE" && (
               <Composer
                 disabled={!live || busy}
@@ -139,6 +164,15 @@ export function Console({ deviceId, deviceLabel }: { deviceId: string; deviceLab
                 busy={busy || !live}
                 onPause={() => act({ type: "PAUSE_TASK" })}
                 onResume={() => act({ type: "RESUME_TASK" })}
+                onCancel={() => act({ type: "CANCEL_TASK" })}
+              />
+            )}
+
+            {status === "NEEDS_INPUT" && task && (
+              <QuestionCard
+                task={task}
+                busy={busy || !live}
+                onAnswer={(description) => act({ type: "ANSWER", description })}
                 onCancel={() => act({ type: "CANCEL_TASK" })}
               />
             )}

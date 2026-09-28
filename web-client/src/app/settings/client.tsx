@@ -5,7 +5,14 @@ import { useRouter } from "next/navigation";
 import { authClient } from "@/lib/auth-client";
 import { IconCheck, IconCopy, IconMonitor } from "@/components/icons";
 import { QrScanner } from "@/components/qr-scanner";
-import { linkDevice, unlinkDevice, type LinkState } from "./actions";
+import {
+  linkDevice,
+  removeOpenRouterKey,
+  saveOpenRouterKey,
+  unlinkDevice,
+  type KeyState,
+  type LinkState,
+} from "./actions";
 
 const inputCls =
   "h-12 w-full rounded-xl border border-line bg-ink px-3.5 text-base text-fg outline-none transition placeholder:text-faint focus:border-line-strong";
@@ -185,6 +192,104 @@ export function DeviceCard({
         </button>
       </div>
     </div>
+  );
+}
+
+/**
+ * The user's own OpenRouter key. The saved key never comes back to the
+ * browser — only `sk-or-…last4` — so "replace" means entering a new one.
+ */
+export function ApiKeyCard({ last4, updatedAt }: { last4: string | null; updatedAt: string | null }) {
+  const [state, action, pending] = useActionState<KeyState, FormData>(saveOpenRouterKey, null);
+  const [editing, setEditing] = useState(!last4);
+  const [confirming, setConfirming] = useState(false);
+  const [removing, startRemove] = useTransition();
+  const formRef = useRef<HTMLFormElement>(null);
+
+  useEffect(() => {
+    if (state?.ok) {
+      setEditing(false);
+      formRef.current?.reset();
+    }
+  }, [state]);
+
+  const saved = last4 && !editing;
+
+  return (
+    <>
+      {saved ? (
+        <div className="rounded-2xl border border-line bg-panel">
+          <div className="p-4">
+            <p className="font-mono text-[14px]">sk-or-…{last4}</p>
+            {updatedAt && (
+              <p className="mt-1 font-mono text-[11px] text-faint">
+                Saved{" "}
+                {new Date(updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
+              </p>
+            )}
+          </div>
+          <div className="grid grid-cols-2 border-t border-line text-[14px]">
+            <button onClick={() => setEditing(true)} className="h-12 border-r border-line text-fg active:bg-raised">
+              Replace
+            </button>
+            <button
+              disabled={removing}
+              onClick={() => {
+                if (!confirming) {
+                  setConfirming(true);
+                  setTimeout(() => setConfirming(false), 3000);
+                  return;
+                }
+                startRemove(() => removeOpenRouterKey());
+              }}
+              className="h-12 text-danger active:bg-raised disabled:opacity-60"
+            >
+              {removing ? "Removing…" : confirming ? "Tap to confirm" : "Remove"}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <form ref={formRef} action={action} className="space-y-4 rounded-2xl border border-line bg-panel p-4">
+          <label className="block">
+            <span className="label">OpenRouter API key</span>
+            <input
+              name="key"
+              type="password"
+              required
+              autoComplete="off"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
+              placeholder="sk-or-…"
+              className={`${inputCls} mt-2 font-mono`}
+            />
+          </label>
+          {state?.error && <p className="font-mono text-[12px] text-danger">{state.error}</p>}
+          <div className="flex gap-2">
+            <button
+              disabled={pending}
+              className="h-12 flex-1 rounded-xl bg-fg font-medium text-ink transition active:scale-[0.98] disabled:opacity-50"
+            >
+              {pending ? "Checking…" : "Save"}
+            </button>
+            {last4 && (
+              <button
+                type="button"
+                onClick={() => setEditing(false)}
+                className="h-12 rounded-xl border border-line px-4 text-[14px] text-dim"
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+        </form>
+      )}
+      {state?.warning && <p className="font-mono text-[12px] text-hold">{state.warning}</p>}
+      <p className="text-[13px] leading-relaxed text-faint">
+        Set a credit limit on this key in OpenRouter (Settings → Keys) so a runaway task can never spend more than
+        you expect.
+      </p>
+    </>
   );
 }
 

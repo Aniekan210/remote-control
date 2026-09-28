@@ -3,6 +3,7 @@
 package main
 
 import (
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -230,10 +231,14 @@ func RightClick() {
 // TypeText turns one KEYBOARD_INPUT's key_string into keystrokes. It has
 // two modes, mixed freely within a single string:
 //
-//   - Literal characters are typed as Unicode packets (KEYEVENTF_UNICODE),
-//     which sidesteps virtual-key/layout mapping and covers the Basic
-//     Multilingual Plane (runes beyond it — rare emoji, some CJK
-//     extensions — would need surrogate pairs, not implemented).
+//   - Literal text. Short plain-ASCII runs are typed as Unicode packets
+//     (KEYEVENTF_UNICODE), which sidesteps virtual-key/layout mapping.
+//     Runs longer than pasteThreshold characters, or with any non-ASCII
+//     character, are pasted instead (clipboard + Ctrl+V, then the user's
+//     clipboard is put back): one atomic paste is faster, and apps can drop
+//     or reorder long bursts of Unicode packets, or mangle characters
+//     outside the Basic Multilingual Plane (emoji), which packets can't
+//     send at all. If the clipboard can't be used, the run is typed.
 //   - {TOKEN} sequences press real keys and chords: {WIN}, {ENTER}, {TAB},
 //     {ESC}, {WIN+D} (show desktop), {ALT+F4} (close window),
 //     {CTRL+SHIFT+ESC}, arrows, F-keys, etc. See handleKeyToken.
@@ -243,6 +248,15 @@ func RightClick() {
 // to Enter/Tab/Backspace so older outputs keep working.
 func TypeText(s string) {
 	runes := []rune(s)
+	var run []rune // pending literal text
+
+	flush := func() {
+		if len(run) > 0 {
+			typeLiteral(run)
+			run = run[:0]
+		}
+	}
+
 	i := 0
 	for i < len(runes) {
 		r := runes[i]
@@ -250,6 +264,7 @@ func TypeText(s string) {
 		if r == '{' {
 			// Look for a matching '}' and try to handle the token inside.
 			if j := indexRune(runes, '}', i+1); j >= 0 {
+				flush()
 				if handleKeyToken(string(runes[i+1 : j])) {
 					i = j + 1
 					continue
@@ -260,21 +275,52 @@ func TypeText(s string) {
 
 		switch r {
 		case '\n', '\r':
+			flush()
 			sendVirtualKey(vkReturn)
 		case '\t':
+			flush()
 			sendVirtualKey(vkTab)
 		case '\b':
+			flush()
 			sendVirtualKey(vkBack)
 		default:
-			if r <= 0xFFFF {
-				code := uint16(r)
-				sendKeybdEvent(code, keyEventFUnicode)
-				sendKeybdEvent(code, keyEventFUnicode|keyEventFKeyUp)
-				time.Sleep(8 * time.Millisecond)
-			}
+			run = append(run, r)
 		}
 		i++
 	}
+	flush()
+}
+
+// pasteThreshold: literal runs longer than this (in characters) are pasted.
+const pasteThreshold = 20
+
+// typeLiteral enters one run of literal text: pasted when it's long or
+// not plain ASCII, typed otherwise (see TypeText).
+func typeLiteral(run []rune) {
+	if len(run) > pasteThreshold || !isASCII(run) {
+		if err := pasteText(string(run)); err == nil {
+			return
+		} else {
+			log.Printf("input: clipboard paste failed (%v) — typing the text instead", err)
+		}
+	}
+	for _, r := range run {
+		if r <= 0xFFFF {
+			code := uint16(r)
+			sendKeybdEvent(code, keyEventFUnicode)
+			sendKeybdEvent(code, keyEventFUnicode|keyEventFKeyUp)
+			time.Sleep(8 * time.Millisecond)
+		}
+	}
+}
+
+func isASCII(rs []rune) bool {
+	for _, r := range rs {
+		if r > 0x7E || (r < 0x20 && r != '\t') {
+			return false
+		}
+	}
+	return true
 }
 
 func indexRune(rs []rune, target rune, from int) int {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -76,6 +77,9 @@ func main() {
 	// This is pure file I/O — no window or device context involved — so
 	// it's safe to do before setDPIAware() below, and doing it first means
 	// setDPIAware()'s own log line actually lands in the file.
+	evalPath := flag.String("eval", "", "run the evaluation tasks in this JSON file (e.g. eval\\tasks.json), print the results and exit — costs real OpenRouter credit")
+	flag.Parse()
+
 	logFile := setupLogging()
 	if logFile != nil {
 		defer logFile.Close()
@@ -98,6 +102,11 @@ func main() {
 		log.Fatalf("failed to get/create device id: %v", err)
 	}
 
+	workerSecret, err := GetOrCreateWorkerSecret()
+	if err != nil {
+		log.Fatalf("failed to get/create worker secret: %v", err)
+	}
+
 	fmt.Println("=====================================")
 	fmt.Println(" RemoteWorker starting")
 	fmt.Println(" Device ID:", deviceID)
@@ -106,7 +115,7 @@ func main() {
 	// Register ourselves with the server. The server's room table is
 	// in-memory only, so this runs on every boot, not just the first —
 	// a 409 (already registered) is treated as success.
-	if err := RegisterRoom(serverAddr, deviceID); err != nil {
+	if err := RegisterRoom(serverAddr, deviceID, workerSecret); err != nil {
 		log.Printf("warning: failed to register room after retries: %v", err)
 		log.Printf("will still try to connect — the room may already exist on the server")
 	}
@@ -115,7 +124,7 @@ func main() {
 	// later launch, the cached device ID from device.id is reused as-is
 	// (it never changes/regenerates) and this popup is skipped — the ID
 	// is still printed above and in the log on every run either way.
-	if isNew {
+	if isNew && *evalPath == "" {
 		log.Println("this is a freshly generated device ID (first-ever launch) — opening pairing page")
 		ShowPairingUI(deviceID)
 	} else {
@@ -136,7 +145,7 @@ func main() {
 	fsStore := NewSnapshotStore()
 
 	go RunFSWatcher(ctx, defaultWatchRoots(), fsStore)
-	go RunWSClient(ctx, wsURL, state, changes)
+	go RunWSClient(ctx, serverAddr, deviceID, workerSecret, wsURL, state, changes)
 	go RunExecutor(state, deviceID, changes, overlayUpdates, fsStore)
 
 	// The overlay is the riskiest code in this project — raw Win32 window
@@ -150,6 +159,13 @@ func main() {
 		go RunOverlay(overlayUpdates, overlayDone)
 	} else {
 		log.Println("overlay disabled via REMOTE_WORKER_NO_OVERLAY=1")
+		// Nothing else reads overlayUpdates, and the executor's sends to it
+		// block once its buffer is full — without a reader the worker
+		// would stop running tasks after a handful of updates.
+		go func() {
+			for range overlayUpdates {
+			}
+		}()
 	}
 
 	// Human-takeover pause: moving the physical mouse pauses automation (see
@@ -168,8 +184,25 @@ func main() {
 		log.Println("human-takeover pause disabled via REMOTE_WORKER_NO_TAKEOVER=1")
 	}
 
+	// Kill switch on the laptop itself: Ctrl+Alt+Shift+X cancels the
+	// current task even if the phone is offline (see hotkey.go).
+	go RunCancelHotkey(func() {
+		CancelLocally(state.LastTask().Seq)
+		takeover.ServerResume() // release a takeover hold so the executor sees the cancel and stops
+		pushOverlay(overlayUpdates, OverlayState{Visible: false})
+		go SendAction(state, Action{Type: "CANCEL_TASK", DeviceID: deviceID})
+	})
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
+
+	if *evalPath != "" {
+		go func() {
+			RunEval(*evalPath, state, deviceID)
+			sigCh <- os.Interrupt
+		}()
+	}
+
 	<-sigCh
 
 	log.Println("shutting down")

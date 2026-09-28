@@ -69,7 +69,7 @@ Create an account and open the Remote Control dashboard.
 
 Download and run:
 
-`/desktop-worker/builds/remoteworker-unlogged-windows-build-v1.exe`
+the unlogged `.exe` from [the latest release](https://github.com/Aniekan210/remote-control/releases/latest)
 
 The desktop worker runs on the computer you want Remote Control to control.
 

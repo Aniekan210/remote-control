@@ -14,6 +14,22 @@ type State struct {
 	mu       sync.Mutex
 	conn     *websocket.Conn
 	lastTask Task
+	frame    shotFrame // the last screenshot sent: the frame the next actions' coordinates are in
+}
+
+// SetFrame records the size of the screenshot just sent (and of the real
+// screen), so the actions that come back can be scaled onto the screen.
+func (s *State) SetFrame(f shotFrame) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.frame = f
+}
+
+// Frame returns the last screenshot's frame.
+func (s *State) Frame() shotFrame {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.frame
 }
 
 func NewState() *State {
@@ -41,6 +57,13 @@ func (s *State) CurrentStatus() string {
 	return s.lastTask.Status
 }
 
+// LastTask returns the most recently received task state.
+func (s *State) LastTask() Task {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastTask
+}
+
 // UpdateTask stores the freshly received task and reports whether it
 // actually differs from what we last saw. Duplicate/no-op broadcasts
 // (which the server can legitimately send) are filtered out here so
@@ -49,11 +72,8 @@ func (s *State) UpdateTask(newTask Task) (prev Task, changed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev = s.lastTask
-	if reflect.DeepEqual(prev, newTask) {
-		return prev, false
-	}
 	s.lastTask = newTask
-	return prev, true
+	return prev, !reflect.DeepEqual(prev, newTask)
 }
 
 // TaskChange is pushed from the WebSocket reader to the executor whenever
@@ -69,8 +89,8 @@ type TaskChange struct {
 // Chrome." — instead of just a static status word.
 type OverlayState struct {
 	Visible bool
-	// Status is "RUNNING", "PAUSED", or "COMPLETED" — drives the status
-	// dot color and the small label text.
+	// Status is "RUNNING", "PAUSED", "NEEDS_INPUT" or "COMPLETED" — drives
+	// the border color (NEEDS_INPUT shows amber, like PAUSED).
 	Status string
 	// TaskDescription is the overall goal the user typed ("open chrome and
 	// search for cats") — shown small/muted for context above the current

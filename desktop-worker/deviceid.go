@@ -70,3 +70,36 @@ func GetOrCreateDeviceID() (id string, isNew bool, err error) {
 	}
 	return id, true, nil
 }
+
+// GetOrCreateWorkerSecret returns this install's random worker secret,
+// stored next to device.id as worker.secret and generated on first use.
+// The worker sends it when registering the room (POST /rooms) and on every
+// /ws connection; the server only lets the connection that knows it act as
+// the worker (send ADVANCE). Unlike the device ID — which is shown in the
+// QR code and stored in the web app's database — the secret never leaves
+// this machine except to the server.
+func GetOrCreateWorkerSecret() (string, error) {
+	appDir, err := AppDataDir()
+	if err != nil {
+		return "", err
+	}
+	secretPath := filepath.Join(appDir, "worker.secret")
+
+	if data, err := os.ReadFile(secretPath); err == nil {
+		existing := strings.TrimSpace(string(data))
+		if existing != "" {
+			return existing, nil
+		}
+	}
+
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	secret := hex.EncodeToString(buf)
+
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		return "", err
+	}
+	return secret, nil
+}

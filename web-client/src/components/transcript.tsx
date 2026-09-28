@@ -38,7 +38,9 @@ type RowState = "done" | "current" | "pending" | "stopped";
  */
 export function Transcript({ t, now, live }: { t: Timeline; now: number; live: boolean }) {
   const running = t.status === "RUNNING" && !t.outcome;
-  const paused = t.status === "PAUSED";
+  const waiting = t.status === "NEEDS_INPUT" && !t.outcome;
+  // Waiting on your answer looks and behaves like a pause in the transcript.
+  const paused = t.status === "PAUSED" || waiting;
   const planning = t.steps.length === 0 && !t.outcome;
   const active = activeStepIndex(t);
   const done = t.outcome === "completed";
@@ -68,8 +70,10 @@ export function Transcript({ t, now, live }: { t: Timeline; now: number; live: b
               ? `finished in ${fmtDuration(elapsed)}`
               : t.outcome
                 ? `stopped after ${fmtDuration(elapsed)}`
-                : paused
-                  ? `paused · ${fmtDuration(elapsed)}`
+                : waiting
+                  ? `waiting for you · ${fmtDuration(elapsed)}`
+                  : paused
+                    ? `paused · ${fmtDuration(elapsed)}`
                   : `working · ${fmtDuration(elapsed)}`}
           </span>
         </div>
@@ -139,10 +143,14 @@ export function Transcript({ t, now, live }: { t: Timeline; now: number; live: b
           <p className="mt-4 flex items-center gap-2 pl-8 font-mono text-[12px]">
             {!live ? (
               <span className="text-hold">Connection lost — the task keeps running on your computer.</span>
+            ) : waiting ? (
+              <span className="text-hold">Waiting for your answer below.</span>
             ) : paused ? (
               <span className="text-hold">Paused. Nothing will happen until you resume.</span>
             ) : planning ? (
               <span className="shimmer">Reading your request…</span>
+            ) : t.revising ? (
+              <span className="shimmer">Revising the plan…</span>
             ) : (
               <span className="shimmer">
                 Step {active + 1} of {t.steps.length} in progress
@@ -351,6 +359,21 @@ function ActionItem({ e, latest }: { e: Execution; latest: boolean }) {
 }
 
 function MarkRow({ m }: { m: Mark }) {
+  if (m.kind === "question" || m.kind === "answer") return <QuestionMarkRow m={m} />;
+  if (m.kind === "replan") {
+    return (
+      <Row
+        icon={<IconDot width={12} height={12} className="text-signal" />}
+        last={false}
+        header={
+          <span className="flex items-start justify-between gap-3 text-[13px]">
+            <span className="leading-snug text-dim">Plan updated{m.text ? `: ${m.text}` : ""}</span>
+            <Meta>{fmtClock(m.at)}</Meta>
+          </span>
+        }
+      />
+    );
+  }
   const Icon = m.kind === "paused" ? IconPause : IconPlay;
   return (
     <Row
@@ -360,6 +383,38 @@ function MarkRow({ m }: { m: Mark }) {
         <span className="flex items-baseline justify-between gap-3 text-[13px]">
           <span className={m.kind === "paused" ? "text-hold" : "text-dim"}>
             {m.kind === "paused" ? "Paused" : "Resumed"} {m.byYou ? "by you" : "from another device"}
+          </span>
+          <Meta>{fmtClock(m.at)}</Meta>
+        </span>
+      }
+    />
+  );
+}
+
+function QuestionMarkRow({ m }: { m: Mark }) {
+  const asking = m.kind === "question";
+  return (
+    <Row
+      icon={
+        asking ? (
+          <span className="grid size-[19px] place-items-center rounded-full border border-hold/60 font-mono text-[11px] text-hold">
+            ?
+          </span>
+        ) : (
+          <IconCheck width={12} height={12} className="text-dim" />
+        )
+      }
+      last={false}
+      header={
+        <span className="flex items-start justify-between gap-3 text-[13px]">
+          <span className={`leading-snug ${asking ? "text-hold" : "text-dim"}`}>
+            {asking ? (
+              <>Needs your input: {m.text || "a question"}</>
+            ) : (
+              <>
+                {m.byYou ? "You" : "Answered from another device"}: {m.text}
+              </>
+            )}
           </span>
           <Meta>{fmtClock(m.at)}</Meta>
         </span>

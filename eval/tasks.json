@@ -1,0 +1,78 @@
+{
+  "_comment": "Fixed everyday tasks for `remoteworker -eval`. Each run costs real OpenRouter money: run it deliberately. Checks: expect_status (COMPLETED or NEEDS_INPUT, the status the task must end in), window_title_contains (foreground window title when it ends, case-insensitive), file_exists / file_contains (~ = home folder), max_questions (NEEDS_INPUT questions allowed before the end). setup_files are created before the task and cleanup_files deleted after it.",
+  "timeout_seconds": 300,
+  "tasks": [
+    {
+      "name": "open-notepad",
+      "description": "Open Notepad.",
+      "expect_status": "COMPLETED",
+      "window_title_contains": "Notepad",
+      "max_questions": 0
+    },
+    {
+      "name": "write-desktop-note",
+      "description": "Create a text file on my Desktop called rc-eval-note.txt that says hello from remote control, and save it.",
+      "expect_status": "COMPLETED",
+      "file_contains": { "path": "~\\Desktop\\rc-eval-note.txt", "text": "hello from remote control" },
+      "max_questions": 0,
+      "cleanup_files": ["~\\Desktop\\rc-eval-note.txt"]
+    },
+    {
+      "name": "google-search",
+      "description": "Search Google for weather in Lagos.",
+      "expect_status": "COMPLETED",
+      "window_title_contains": "weather in Lagos",
+      "max_questions": 0
+    },
+    {
+      "name": "youtube-search",
+      "description": "Search YouTube for lofi hip hop radio.",
+      "expect_status": "COMPLETED",
+      "window_title_contains": "YouTube",
+      "max_questions": 0
+    },
+    {
+      "name": "open-downloads",
+      "description": "Open my Downloads folder.",
+      "expect_status": "COMPLETED",
+      "window_title_contains": "Downloads",
+      "max_questions": 0
+    },
+    {
+      "name": "open-named-file",
+      "description": "Open rc-eval-readme.txt from my Desktop.",
+      "expect_status": "COMPLETED",
+      "window_title_contains": "rc-eval-readme",
+      "max_questions": 0,
+      "setup_files": [{ "path": "~\\Desktop\\rc-eval-readme.txt", "text": "Remote Control eval file." }],
+      "cleanup_files": ["~\\Desktop\\rc-eval-readme.txt"]
+    },
+    {
+      "name": "calculator",
+      "description": "Open Calculator and work out 12 times 34.",
+      "expect_status": "COMPLETED",
+      "window_title_contains": "Calculator",
+      "max_questions": 0
+    },
+    {
+      "name": "cookie-banner-stackoverflow",
+      "description": "Go to stackoverflow.com and open the Questions page.",
+      "_obstacle": "A cookie consent banner covers the page on first visit. It must be dismissed without asking.",
+      "expect_status": "COMPLETED",
+      "window_title_contains": "Questions",
+      "max_questions": 0
+    },
+    {
+      "name": "impossible-missing-file",
+      "description": "Open the file quarterly-report-1999-final-v7.xlsx from my Desktop.",
+      "_obstacle": "The file does not exist. The run must end asking the user, not loop and not claim COMPLETED.",
+      "expect_status": "NEEDS_INPUT"
+    },
+    {
+      "name": "impossible-missing-app",
+      "description": "Open the app called Zorblax Studio 9000 and start a new project.",
+      "_obstacle": "No such app is installed. The run must end asking the user.",
+      "expect_status": "NEEDS_INPUT"
+    }
+  ]
+}

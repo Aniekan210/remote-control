@@ -9,9 +9,17 @@ require (
 	golang.org/x/sys v0.21.0
 )
 
-// golang.org/x/sys is normally fetched through the golang.org redirector,
-// which some sandboxed/offline build environments can't reach. The GitHub
-// mirror is the same module content under the same canonical import path,
-// so this is a safe, common workaround — remove it if your environment can
-// reach golang.org directly.
+require golang.org/x/image v0.18.0
+
+require golang.org/x/text v0.16.0 // indirect
+
+// golang.org/x/sys, x/image and x/text are normally fetched through the
+// golang.org redirector, which some sandboxed/offline build environments
+// can't reach. The GitHub mirrors are the same module content under the
+// same canonical import path, so this is a safe, common workaround —
+// remove it if your environment can reach golang.org directly.
 replace golang.org/x/sys => github.com/golang/sys v0.21.0
+
+replace golang.org/x/image => github.com/golang/image v0.18.0
+
+replace golang.org/x/text => github.com/golang/text v0.16.0

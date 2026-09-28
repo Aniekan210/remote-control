@@ -5,6 +5,7 @@ const STATUS: Record<TaskStatus, { label: string; dot: string; text: string; bli
   NONE: { label: "Idle", dot: "bg-faint", text: "text-dim" },
   RUNNING: { label: "Running", dot: "bg-signal", text: "text-signal", blink: true },
   PAUSED: { label: "Paused", dot: "bg-hold", text: "text-hold" },
+  NEEDS_INPUT: { label: "Needs you", dot: "bg-hold", text: "text-hold", blink: true },
   COMPLETED: { label: "Done", dot: "bg-done", text: "text-done" },
 };
 

@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { requireSession } from "@/lib/session";
 import { DeviceTakenError, removeDevice, upsertDevice } from "@/lib/device";
 import { DEVICE_ID_PATTERN } from "@/lib/device-id";
+import { checkKey, removeKey, saveKey } from "@/lib/openrouter-key";
 
 export type LinkState = { ok: boolean; error?: string } | null;
 
@@ -31,6 +32,38 @@ export async function linkDevice(_prev: LinkState, form: FormData): Promise<Link
   revalidatePath("/");
   revalidatePath("/settings");
   return { ok: true };
+}
+
+export type KeyState = { ok: boolean; error?: string; warning?: string } | null;
+
+export async function saveOpenRouterKey(_prev: KeyState, form: FormData): Promise<KeyState> {
+  const session = await requireSession();
+  const key = String(form.get("key") ?? "").trim();
+
+  if (!/^sk-or-[A-Za-z0-9_-]{8,}$/.test(key)) {
+    return { ok: false, error: "That doesn't look like an OpenRouter key (they start with sk-or-)." };
+  }
+
+  const check = await checkKey(key);
+  if (!check.ok) return { ok: false, error: check.error };
+
+  try {
+    await saveKey(session.user.id, key);
+  } catch (err) {
+    console.error("saveOpenRouterKey", err);
+    return { ok: false, error: "Couldn't save the key. Try again." };
+  }
+
+  revalidatePath("/settings");
+  return check.hasLimit
+    ? { ok: true }
+    : { ok: true, warning: "Saved. This key has no credit limit — set one in OpenRouter so a runaway task can't overspend." };
+}
+
+export async function removeOpenRouterKey(): Promise<void> {
+  const session = await requireSession();
+  await removeKey(session.user.id);
+  revalidatePath("/settings");
 }
 
 export async function unlinkDevice(): Promise<void> {

@@ -4,9 +4,12 @@
  * Once you know the real shape, you can delete the fallbacks.
  */
 
-export type TaskStatus = "NONE" | "RUNNING" | "PAUSED" | "COMPLETED";
+export type TaskStatus = "NONE" | "RUNNING" | "PAUSED" | "NEEDS_INPUT" | "COMPLETED";
 
 export type Execution = Record<string, unknown>;
+
+/** blocked = it can't go on as asked · confirm = approve an irreversible step · budget = a per-task cap was reached */
+export type QuestionKind = "blocked" | "confirm" | "budget";
 
 export type Task = {
   deviceId: string;
@@ -17,6 +20,27 @@ export type Task = {
   executionList: Execution[];
   /** true while the AI is planning (instruction list not generated yet) */
   planning: boolean;
+  /** bumped by the server on every broadcast the worker must act on */
+  seq: number;
+  /** why the next planner call is a revise, not a fresh plan ("" on the first plan) */
+  reason: string;
+  /** shown to the user while status is NEEDS_INPUT */
+  question: string;
+  questionKind: QuestionKind | "";
+  /** data: URL of the screen when the question was asked */
+  questionImage: string;
+  /** every "Q: … / A: …" pair so far */
+  answers: string[];
+  /** automatic revises so far */
+  autoReplans: number;
+  /** index of the last step the user approved (-1 = none) */
+  confirmedIndex: number;
+  /** parallel to instructionList: steps that need approval before they run */
+  needsConfirm: boolean[];
+  /** OpenRouter spend on this task so far, in USD */
+  costUsd: number;
+  /** one-off error from the server (budget reached, missing key…); cleared on the next accepted action */
+  lastError: string;
 };
 
 export const EMPTY_TASK: Task = {
@@ -27,6 +51,17 @@ export const EMPTY_TASK: Task = {
   instructionList: [],
   executionList: [],
   planning: false,
+  seq: 0,
+  reason: "",
+  question: "",
+  questionKind: "",
+  questionImage: "",
+  answers: [],
+  autoReplans: 0,
+  confirmedIndex: -1,
+  needsConfirm: [],
+  costUsd: 0,
+  lastError: "",
 };
 
 type Obj = Record<string, unknown>;
@@ -36,7 +71,8 @@ function pick(o: Obj, ...keys: string[]): unknown {
   return undefined;
 }
 
-const STATUSES: TaskStatus[] = ["NONE", "RUNNING", "PAUSED", "COMPLETED"];
+const STATUSES: TaskStatus[] = ["NONE", "RUNNING", "PAUSED", "NEEDS_INPUT", "COMPLETED"];
+const QUESTION_KINDS: QuestionKind[] = ["blocked", "confirm", "budget"];
 
 export function normalizeTask(raw: unknown): Task {
   if (!raw || typeof raw !== "object") return EMPTY_TASK;
@@ -44,6 +80,9 @@ export function normalizeTask(raw: unknown): Task {
   const status = String(pick(o, "Status", "status") ?? "NONE").toUpperCase() as TaskStatus;
   const instructions = pick(o, "InstructionList", "instructionList", "instruction_list");
   const executions = pick(o, "ExecutionList", "executionList", "execution_list");
+  const answers = pick(o, "Answers", "answers");
+  const needsConfirm = pick(o, "NeedsConfirm", "needsConfirm", "needs_confirm");
+  const questionKind = String(pick(o, "QuestionKind", "questionKind", "question_kind") ?? "");
   return {
     deviceId: String(pick(o, "DeviceID", "deviceId", "device_id") ?? ""),
     description: String(pick(o, "Description", "description") ?? ""),
@@ -56,6 +95,17 @@ export function normalizeTask(raw: unknown): Task {
       ? executions.map((e) => (e && typeof e === "object" ? (e as Execution) : { value: e }))
       : [],
     planning: Boolean(pick(o, "Context", "context")),
+    seq: Number(pick(o, "Seq", "seq") ?? 0) || 0,
+    reason: String(pick(o, "Reason", "reason") ?? ""),
+    question: String(pick(o, "Question", "question") ?? ""),
+    questionKind: QUESTION_KINDS.includes(questionKind as QuestionKind) ? (questionKind as QuestionKind) : "",
+    questionImage: String(pick(o, "QuestionImage", "questionImage", "question_image") ?? ""),
+    answers: Array.isArray(answers) ? answers.map(String) : [],
+    autoReplans: Number(pick(o, "AutoReplans", "autoReplans", "auto_replans") ?? 0) || 0,
+    confirmedIndex: Number(pick(o, "ConfirmedIndex", "confirmedIndex", "confirmed_index") ?? -1),
+    needsConfirm: Array.isArray(needsConfirm) ? needsConfirm.map(Boolean) : [],
+    costUsd: Number(pick(o, "CostUSD", "costUsd", "cost_usd") ?? 0) || 0,
+    lastError: String(pick(o, "LastError", "lastError", "last_error") ?? ""),
   };
 }
 
@@ -75,4 +125,6 @@ export type ClientAction =
   | { type: "CREATE_TASK"; description: string }
   | { type: "PAUSE_TASK" }
   | { type: "RESUME_TASK" }
-  | { type: "CANCEL_TASK" };
+  | { type: "CANCEL_TASK" }
+  /** reply to the current question (NEEDS_INPUT); "approve" approves a confirm question */
+  | { type: "ANSWER"; description: string };

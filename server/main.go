@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -46,6 +49,21 @@ func handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 	mutex.Lock()
 
 	if _, exists := taskHashTable[req.DeviceID]; exists {
+		// The worker re-registers on every boot and after a 404, so an
+		// existing room is normal — as long as it's the same worker. A
+		// different secret means someone else is claiming this device ID.
+		// A room registered without a secret (a pre-auth worker) is
+		// upgraded to the first secret that shows up.
+		existing := roomSecrets[req.DeviceID]
+		switch {
+		case existing == "" && req.WorkerSecret != "":
+			roomSecrets[req.DeviceID] = req.WorkerSecret
+		case existing != "" && !secretsEqual(existing, req.WorkerSecret):
+			mutex.Unlock()
+			srvLogf("POST /rooms rejected: room for device=%s is owned by a different worker secret", req.DeviceID)
+			http.Error(w, "Room is owned by another worker", http.StatusForbidden)
+			return
+		}
 		mutex.Unlock()
 		srvLogf("POST /rooms: room already exists for device=%s", req.DeviceID)
 		http.Error(w, "Room already exists", http.StatusConflict)
@@ -53,8 +71,13 @@ func handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	taskHashTable[req.DeviceID] = resetTask(req.DeviceID)
+	roomSecrets[req.DeviceID] = req.WorkerSecret
 
 	mutex.Unlock()
+
+	if req.WorkerSecret == "" {
+		srvLogf("WARNING: device=%s registered without a worker secret (old worker build) — it can only connect while CONTROL_SHARED_SECRET is unset", req.DeviceID)
+	}
 
 	srvLogf("POST /rooms: created room for device=%s", req.DeviceID)
 
@@ -88,14 +111,29 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Who is this? The worker proves the room's secret; a web client
+	// proves a fresh token minted by the Next.js app. Anyone else is
+	// turned away before the upgrade.
+	role, ok := authenticateConnection(r, taskID, roomSecrets[taskID])
+	if !ok {
+		mutex.Unlock()
+		srvLogf("WS connection rejected: unauthorized for device=%s (remote=%s)", taskID, r.RemoteAddr)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	// Register the client
 	if rooms[taskID] == nil {
 		rooms[taskID] = make(map[*websocket.Conn]bool)
 	}
 
-	// Accept the WebSocket connection
+	// Accept the WebSocket connection. Browsers always send an Origin
+	// header, so only the web app (and local dev) may open a socket from a
+	// page; this stops some other site from driving the computer through a
+	// visitor's browser. The Go worker sends no Origin header at all, which
+	// the library accepts without checking.
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true,
+		OriginPatterns: []string{"control.aniekan.dev", "localhost:*"},
 	})
 
 	if err != nil {
@@ -118,8 +156,8 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 
 	mutex.Unlock()
 
-	srvLogf("WS connected: device=%s remote=%s clientsInRoom=%d currentStatus=%s",
-		taskID, r.RemoteAddr, clientCount, currentTask.Status)
+	srvLogf("WS connected: device=%s remote=%s role=%s clientsInRoom=%d currentStatus=%s",
+		taskID, r.RemoteAddr, role, clientCount, currentTask.Status)
 
 	defer conn.Close(websocket.StatusInternalError, "connection closing")
 
@@ -155,206 +193,175 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 
 		srvLogf("device=%s: received action type=%s", taskID, action.Type)
 
-		mutex.Lock()
-
-		task := taskHashTable[taskID]
-		prevStatus := task.Status
-
-		switch action.Type {
-		case "CREATE_TASK":
-			// Full reset, not just overwrite: a device that ran a previous
-			// task (completed, paused, or otherwise not explicitly
-			// CANCEL_TASK'd) still has that task's leftover
-			// CurrentInstructionIndex/InstructionList/ExecutionList sitting
-			// in taskHashTable — CREATE_TASK used to only touch
-			// Description/Context/Status, so a stale non-empty
-			// ExecutionList would survive into the new task. The worker's
-			// executor treats "ExecutionList non-empty" as "re-run these
-			// actions" unconditionally, so it would replay the OLD task's
-			// last batch of clicks/keystrokes instead of sending the
-			// ADVANCE that starts planning the NEW task — which looks
-			// exactly like "ADVANCE is never sent" from the server's side,
-			// since the worker is busy doing something else instead.
-			task = Task{
-				DeviceID:                taskID,
-				Description:             action.Description,
-				Status:                  "RUNNING",
-				CurrentInstructionIndex: 0,
-				InstructionList:         make([]string, 0),
-				ExecutionList:           make([]Execution, 0),
-				Context:                 true,
-			}
-			srvLogf("device=%s: CREATE_TASK description=%q (full state reset)", taskID, action.Description)
-
-		case "ADVANCE":
-			srvLogf("device=%s: ADVANCE received, context=%v currentInstrIdx=%d/%d screenshotBytes=%d fsEntries=%d",
-				taskID, task.Context, task.CurrentInstructionIndex, len(task.InstructionList),
-				len(action.ScreenshotPayload.Data), len(action.FileSystemPayload))
-
-			// If the worker has just finished the final execution,
-			// this ADVANCE means the task is now actually complete.
-			// Do not make another AI call.
-			if !task.Context && task.CurrentInstructionIndex >= len(task.InstructionList) {
-				task.Status = "COMPLETED"
-				task.ExecutionList = make([]Execution, 0)
-
-				srvLogf("device=%s: all instructions executed, task COMPLETED", taskID)
-
-				taskHashTable[taskID] = task
-
-				clients := make([]*websocket.Conn, 0, len(rooms[taskID]))
-				for client := range rooms[taskID] {
-					clients = append(clients, client)
-				}
-
-				mutex.Unlock()
-
-				broadcastToTaskRoom(r.Context(), taskID, task, clients)
-				continue
-			}
-
-			// Release the lock before the network call so a slow request
-			// Release the lock before the network call so a slow request
-			// (or our retries) don't block every other room's messages
-			// from being processed while we wait on the AI.
-			mutex.Unlock()
-
-			var result any
-			var sendErr error
-
-			const maxRetries = 3
-			for attempt := 1; attempt <= maxRetries; attempt++ {
-				callStart := time.Now()
-				result, sendErr = sendMessage(task, action)
-				callElapsed := time.Since(callStart)
-
-				if sendErr == nil {
-					srvLogf("device=%s: sendMessage attempt %d/%d succeeded in %s",
-						taskID, attempt, maxRetries, callElapsed)
-					break
-				}
-				srvLogf("device=%s: sendMessage attempt %d/%d FAILED after %s: %v",
-					taskID, attempt, maxRetries, callElapsed, sendErr)
-				if attempt < maxRetries {
-					backoff := time.Duration(attempt) * time.Second
-					srvLogf("device=%s: retrying in %s", taskID, backoff)
-					time.Sleep(backoff) // 1s, 2s backoff
-				}
-			}
-
-			mutex.Lock()
-
-			// Re-read current state: another message (PAUSE/CANCEL/another
-			// ADVANCE from a different client in the room) may have landed
-			// while we were waiting on the network call.
-			task = taskHashTable[taskID]
-
-			switch {
-			case sendErr != nil:
-				// Never remaking a room, so give up by resetting the task
-				// to a clean slate instead of deleting it from the table.
-				srvLogf("device=%s: giving up after %d attempts, resetting task to NONE: %v",
-					taskID, maxRetries, sendErr)
-				task = resetTask(task.DeviceID)
-
-			case task.Status != "RUNNING":
-				// Task was paused/cancelled/reset while this request was
-				// in flight — drop the now-stale result.
-				srvLogf("device=%s: dropping stale ADVANCE result, status changed to %q while AI call was in flight",
-					taskID, task.Status)
-
-			case task.Context:
-				// Planning call: result is the instruction list.
-				instructions, ok := result.([]string)
-				if !ok {
-					srvLogf("device=%s: expected []string from planning call, got %T (value: %+v) — resetting task",
-						taskID, result, result)
-					task = resetTask(task.DeviceID)
-					break
-				}
-				task.InstructionList = instructions
-				task.CurrentInstructionIndex = 0
-				task.Context = false // next ADVANCE generates executions, not a new plan
-				srvLogf("device=%s: plan set, %d instructions: %v", taskID, len(instructions), instructions)
-
-				// An empty plan means there's nothing to execute. Mark the
-				// task COMPLETED instead of leaving it RUNNING with 0
-				// instructions — otherwise the next ADVANCE asks for
-				// instruction 0 of a 0-length list and fails ("index out of
-				// range") on a loop until the retries give up.
-				if len(instructions) == 0 {
-					task.Status = "COMPLETED"
-					srvLogf("device=%s: planner returned an empty plan, marking COMPLETED", taskID)
-				}
-
-			default:
-				// Execution call: result is the execution list for
-				// the current instruction.
-				executions, ok := result.([]Execution)
-				if !ok {
-					srvLogf("device=%s: expected []Execution from execution call, got %T (value: %+v) — resetting task",
-						taskID, result, result)
-					task = resetTask(task.DeviceID)
-					break
-				}
-
-				task.ExecutionList = executions
-				task.CurrentInstructionIndex++
-
-				srvLogf("device=%s: execution list set (%d actions) for instruction %d/%d: %+v",
-					taskID, len(executions), task.CurrentInstructionIndex, len(task.InstructionList), executions)
-			}
-
-		case "PAUSE_TASK":
-			task.Status = "PAUSED"
-			srvLogf("device=%s: PAUSE_TASK", taskID)
-		case "RESUME_TASK":
-			task.Status = "RUNNING"
-			srvLogf("device=%s: RESUME_TASK", taskID)
-		case "CANCEL_TASK":
-			task = resetTask(task.DeviceID)
-			srvLogf("device=%s: CANCEL_TASK, task reset", taskID)
-		default:
-			srvLogf("device=%s: unknown action type: %q", taskID, action.Type)
-			mutex.Unlock()
+		if !roleMayAct(role, action.Type) {
+			srvLogf("device=%s: ignoring %s from a %s connection (not allowed for that role)", taskID, action.Type, role)
 			continue
 		}
 
-		if task.Status != prevStatus {
-			srvLogf("device=%s: status transition %s -> %s", taskID, prevStatus, task.Status)
+		action.ReceivedAt = time.Now()
+
+		// Anything needing I/O is worked out before taking the lock, and
+		// handed to the (pure) state machine inside the action.
+		var newKey apiKey
+		if action.Type == "CREATE_TASK" {
+			newKey, action.Refused = checkCanStart(r.Context(), taskID)
+		}
+
+		mutex.Lock()
+
+		prev := taskHashTable[taskID]
+		task := onClientAction(prev, action)
+		startCall := task.InFlight && !prev.InFlight
+		changed := visibleChange(prev, task)
+
+		if action.Type == "CREATE_TASK" && action.Refused == "" {
+			taskKeys[taskID] = newKey
+		}
+		if task.Status != prev.Status {
+			srvLogf("device=%s: status transition %s -> %s", taskID, prev.Status, task.Status)
 		}
 
 		taskHashTable[taskID] = task
-
-		// Copy the clients while we have the lock.
-		clients := make([]*websocket.Conn, 0, len(rooms[taskID]))
-
-		for client := range rooms[taskID] {
-			clients = append(clients, client)
-		}
+		clients := roomClients(taskID)
 
 		mutex.Unlock()
 
 		// Network I/O happens AFTER releasing the mutex.
-		broadcastToTaskRoom(r.Context(), taskID, task, clients)
+		if changed {
+			broadcastToTaskRoom(r.Context(), taskID, task, clients)
+		}
+
+		// The AI call runs on its own goroutine, so this connection keeps
+		// reading while it's in flight — a PAUSE_TASK from the worker (the
+		// person grabbed the mouse) lands immediately instead of queueing
+		// behind a call that can take a minute with retries.
+		if startCall {
+			go runAICall(taskID, task, action)
+		}
 	}
 }
 
-// resetTask returns a fresh, empty task for the given device — the same
-// shape CANCEL_TASK produces. Used both for explicit cancellation and for
-// giving up on a task after repeated ADVANCE failures: the room's entry in
-// taskHashTable stays put (rooms are never recreated), it just goes back
-// to a clean NONE state.
-func resetTask(deviceID string) Task {
-	return Task{
-		DeviceID:                deviceID,
-		Description:             "",
-		Status:                  "NONE",
-		CurrentInstructionIndex: 0,
-		InstructionList:         make([]string, 0),
-		ExecutionList:           make([]Execution, 0),
-		Context:                 false,
+// checkCanStart decides whether a new task may start on this device: it
+// returns the key the task will be billed to, or why it can't start (shown
+// to the user as last_error). Every task needs a key — the user's own, or
+// the server's for an owner (OWNER_USER_IDS) — and the monthly budget
+// protects the server's own key: once it's spent, new tasks on it are
+// refused (a running one is left alone). Users' own keys are theirs to
+// limit.
+func checkCanStart(ctx context.Context, deviceID string) (apiKey, string) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	key, err := resolveAPIKey(ctx, deviceID)
+	if err != nil {
+		srvLogf("device=%s: no usable OpenRouter key: %v", deviceID, err)
+		if errors.Is(err, errNoKey) {
+			return apiKey{}, errNoKey.Error()
+		}
+		return apiKey{}, "Couldn't look up your OpenRouter key. Try again."
 	}
+	if spent := costs.serverMonthTotal(); key.serverKey && spent >= limits.MonthlyBudgetUSD {
+		srvLogf("device=%s: monthly budget reached ($%.4f of $%.2f)", deviceID, spent, limits.MonthlyBudgetUSD)
+		return apiKey{}, "Monthly AI budget reached"
+	}
+	return key, ""
+}
+
+// runAICall makes the AI call an ADVANCE asked for (with retries), then
+// feeds the outcome back through the state machine and broadcasts.
+func runAICall(taskID string, task Task, action Action) {
+	mutex.Lock()
+	key, haveKey := taskKeys[taskID]
+	mutex.Unlock()
+
+	if !haveKey {
+		// Only possible for a task created before the server knew about
+		// keys; look it up now rather than failing the task.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		key, _ = resolveAPIKey(ctx, taskID)
+		cancel()
+	}
+
+	res := AIResult{
+		Seq:      task.Seq,
+		Planning: task.Context,
+		Image:    screenshotDataURL(action.ScreenshotPayload),
+	}
+
+	var result any
+	start := time.Now()
+	const maxRetries = 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		callStart := time.Now()
+		var attemptCost float64
+		result, attemptCost, res.Err = sendMessage(task, action, key)
+		res.Cost += attemptCost
+		res.Attempts = attempt
+		callElapsed := time.Since(callStart)
+
+		if res.Err == nil {
+			srvLogf("device=%s: sendMessage attempt %d/%d succeeded in %s",
+				taskID, attempt, maxRetries, callElapsed)
+			break
+		}
+		srvLogf("device=%s: sendMessage attempt %d/%d FAILED after %s: %v",
+			taskID, attempt, maxRetries, callElapsed, res.Err)
+		if aiErrorMessage(res.Err) != "" {
+			break // a bad key or no credits won't fix itself on a retry
+		}
+		if attempt < maxRetries {
+			backoff := time.Duration(attempt) * time.Second
+			srvLogf("device=%s: retrying in %s", taskID, backoff)
+			time.Sleep(backoff) // 1s, 2s backoff
+		}
+	}
+	res.Took = time.Since(start)
+
+	if res.Err == nil {
+		switch v := result.(type) {
+		case PlanResult:
+			res.Plan = v
+		case ExecResult:
+			res.Exec = v
+		default:
+			res.Err = fmt.Errorf("unexpected AI result type %T", result)
+		}
+	}
+
+	mutex.Lock()
+	prev := taskHashTable[taskID]
+	next := onAIResult(prev, res)
+	if next.Status != prev.Status {
+		srvLogf("device=%s: status transition %s -> %s", taskID, prev.Status, next.Status)
+	}
+	taskHashTable[taskID] = next
+	clients := roomClients(taskID)
+	mutex.Unlock()
+
+	if visibleChange(prev, next) {
+		// Not tied to any one connection's context: the connection that
+		// sent the ADVANCE may be gone by now.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		broadcastToTaskRoom(ctx, taskID, next, clients)
+	}
+}
+
+// roomClients copies a room's connections. Caller holds mutex.
+func roomClients(taskID string) []*websocket.Conn {
+	clients := make([]*websocket.Conn, 0, len(rooms[taskID]))
+	for client := range rooms[taskID] {
+		clients = append(clients, client)
+	}
+	return clients
+}
+
+// visibleChange reports whether a transition changed anything clients can
+// see (the broadcast Task); server-only bookkeeping (json:"-") doesn't
+// warrant a broadcast.
+func visibleChange(a, b Task) bool {
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA != nil || errB != nil || !bytes.Equal(ja, jb)
 }
 
 func sendTaskState(ctx context.Context, conn *websocket.Conn, task Task) {
@@ -431,6 +438,23 @@ func main() {
 		srvLogf(".env file loaded")
 	}
 
+	limits = loadLimits()
+	srvLogf("limits: %d AI calls, %d planner calls, $%.2f and %s per task; $%.2f/month on the server key",
+		limits.MaxAICallsPerTask, limits.MaxPlannerCallsPerTask, limits.MaxTaskCostUSD,
+		limits.MaxTaskDuration, limits.MonthlyBudgetUSD)
+
+	costStateFile := os.Getenv("COST_STATE_FILE")
+	if costStateFile == "" {
+		costStateFile = "cost-state.json"
+	}
+	costs = loadCostTracker(costStateFile)
+
+	initDB()
+
+	if sharedSecret() == "" {
+		srvLogf("WARNING: CONTROL_SHARED_SECRET is not set — /ws connections are NOT authenticated. Anyone who knows a device ID can drive that computer. Set it (same value in the Next.js app) to turn auth on.")
+	}
+
 	// HTTP REST endpoint
 	http.HandleFunc("/rooms", handleCreateRoom)
 
@@ -452,6 +476,14 @@ var (
 
 	// Tracks connected clients grouped by Task ID
 	rooms = make(map[string]map[*websocket.Conn]bool)
+
+	// The secret each room's worker registered with (POST /rooms). Kept out
+	// of Task, which is broadcast to every client in full.
+	roomSecrets = map[string]string{}
+
+	// The OpenRouter key each device's current task is billed to (see
+	// keys.go). Kept out of Task for the same reason.
+	taskKeys = map[string]apiKey{}
 
 	mutex sync.Mutex
 )
