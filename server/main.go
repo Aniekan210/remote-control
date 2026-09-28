@@ -125,9 +125,13 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 		rooms[taskID] = make(map[*websocket.Conn]bool)
 	}
 
-	// Accept the WebSocket connection
+	// Accept the WebSocket connection. Browsers always send an Origin
+	// header, so only the web app (and local dev) may open a socket from a
+	// page; this stops some other site from driving the computer through a
+	// visitor's browser. The Go worker sends no Origin header at all, which
+	// the library accepts without checking.
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true,
+		OriginPatterns: []string{"control.aniekan.dev", "localhost:*"},
 	})
 
 	if err != nil {
