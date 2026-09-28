@@ -291,26 +291,11 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
-			// If the worker has just finished the final execution,
-			// this ADVANCE means the task is now actually complete.
-			// Do not make another AI call.
+			// Past the last step, the next executor call is the final
+			// check (see callExecutor): the task is only COMPLETED once
+			// the executor has looked at the screen and agrees it's done.
 			if !task.Context && task.CurrentInstructionIndex >= len(task.InstructionList) {
-				task.Status = "COMPLETED"
-				task.ExecutionList = make([]Execution, 0)
-
-				srvLogf("device=%s: all instructions executed, task COMPLETED", taskID)
-
-				taskHashTable[taskID] = task
-
-				clients := make([]*websocket.Conn, 0, len(rooms[taskID]))
-				for client := range rooms[taskID] {
-					clients = append(clients, client)
-				}
-
-				mutex.Unlock()
-
-				broadcastToTaskRoom(r.Context(), taskID, task, clients)
-				continue
+				srvLogf("device=%s: all instructions executed, running the final check", taskID)
 			}
 
 			// Irreversible steps (send, submit, delete, purchase, post,
@@ -338,9 +323,12 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			if !task.Context && task.InstrAttempts >= maxExecutorCallsPerStep {
 				srvLogf("device=%s: instruction %d not done after %d executor calls, replanning",
 					taskID, task.CurrentInstructionIndex, task.InstrAttempts)
-				task = requestReplan(task, fmt.Sprintf("Step %d (%q) still wasn't done after %d attempts.",
-					task.CurrentInstructionIndex+1, task.InstructionList[task.CurrentInstructionIndex], task.InstrAttempts),
-					screenshotDataURL(action.ScreenshotPayload))
+				reason := fmt.Sprintf("The task still wasn't complete after %d final checks.", task.InstrAttempts)
+				if task.CurrentInstructionIndex < len(task.InstructionList) {
+					reason = fmt.Sprintf("Step %d (%q) still wasn't done after %d attempts.",
+						task.CurrentInstructionIndex+1, task.InstructionList[task.CurrentInstructionIndex], task.InstrAttempts)
+				}
+				task = requestReplan(task, reason, screenshotDataURL(action.ScreenshotPayload))
 				break
 			}
 
@@ -557,7 +545,27 @@ const maxExecutorCallsPerStep = 3
 //
 // image is the screenshot the executor judged, as a data URL, shown with
 // any question that results.
+//
+// Past the last step the call was the final check (E8): skip means the
+// whole task is done (COMPLETED); act runs its fix-up actions and checks
+// again (capped like any step); replan/blocked as usual.
 func applyExecResult(t Task, res ExecResult, image string) Task {
+	if t.CurrentInstructionIndex >= len(t.InstructionList) {
+		switch res.Verdict {
+		case verdictSkip:
+			t.Status = "COMPLETED"
+			t.ExecutionList = make([]Execution, 0)
+			srvLogf("device=%s: final check passed, task COMPLETED", t.DeviceID)
+			return t
+		case verdictAct:
+			t.ExecutionList = res.Actions
+			t.InstrAttempts++
+			srvLogf("device=%s: final check found the task unfinished, running %d fix-up actions: %+v",
+				t.DeviceID, len(res.Actions), res.Actions)
+			return t
+		}
+	}
+
 	switch res.Verdict {
 	case verdictAct:
 		t.ExecutionList = res.Actions

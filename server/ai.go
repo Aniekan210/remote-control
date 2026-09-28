@@ -324,9 +324,13 @@ func mentionsFiles(text string) bool {
 // callExecutor asks the executor for the physical actions that carry out
 // the current instruction.
 func callExecutor(callID string, task Task, action Action, key apiKey) (any, float64, error) {
+	// Past the last step: the final check (E8) — one more look at the
+	// screen before the task may be marked COMPLETED.
+	finalCheck := task.CurrentInstructionIndex >= len(task.InstructionList) && task.CurrentInstructionIndex >= 0
+
 	// Guard against an out-of-range index instead of panicking.
 	if task.CurrentInstructionIndex < 0 ||
-		task.CurrentInstructionIndex >= len(task.InstructionList) {
+		(task.CurrentInstructionIndex > len(task.InstructionList)) {
 		aiLogf("[%s] FAILED instruction index %d out of range (list has %d items): %v",
 			callID, task.CurrentInstructionIndex, len(task.InstructionList), task.InstructionList)
 		return nil, 0, fmt.Errorf(
@@ -341,7 +345,13 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 	h := action.ScreenshotPayload.Height
 
 	idx := task.CurrentInstructionIndex
-	instruction := task.InstructionList[idx]
+	var instruction string
+	if finalCheck {
+		instruction = fmt.Sprintf("Check whether the whole task is complete: %s. If yes, skip. If not, replan or blocked.",
+			strings.TrimRight(task.Description, ". "))
+	} else {
+		instruction = task.InstructionList[idx]
+	}
 
 	aiLogf("[%s] execution request: instruction=%q screenshot=%dx%d imageBytes=%d",
 		callID, instruction, w, h, len(action.ScreenshotPayload.Data))
@@ -397,7 +407,10 @@ func executorUserText(task Task, instruction string, idx int, w, h uint32) strin
 		}
 		fmt.Fprintf(&b, "%s%d. %s\n", marker, i+1, step)
 	}
-	if idx > 0 && idx-1 < len(task.InstructionList) {
+	if idx >= len(task.InstructionList) && len(task.InstructionList) > 0 {
+		b.WriteString("\nAll steps above have been carried out; this is the final check.\n")
+		fmt.Fprintf(&b, "Previous step: %s\n", task.InstructionList[len(task.InstructionList)-1])
+	} else if idx > 0 && idx-1 < len(task.InstructionList) {
 		fmt.Fprintf(&b, "\nPrevious step: %s\n", task.InstructionList[idx-1])
 	} else {
 		b.WriteString("\nPrevious step: (none — this is the first step)\n")
