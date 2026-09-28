@@ -171,6 +171,9 @@ func SendAction(state *State, action Action) {
 		err := conn.Write(ctx, websocket.MessageText, payload)
 		cancel()
 		if err == nil {
+			if action.Type == "ADVANCE" {
+				advancesSent.Add(1) // for the eval harness's report
+			}
 			return
 		}
 		log.Printf("wsclient: send attempt %d failed: %v", attempt+1, err)

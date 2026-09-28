@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -76,6 +77,9 @@ func main() {
 	// This is pure file I/O — no window or device context involved — so
 	// it's safe to do before setDPIAware() below, and doing it first means
 	// setDPIAware()'s own log line actually lands in the file.
+	evalPath := flag.String("eval", "", "run the evaluation tasks in this JSON file (e.g. eval\\tasks.json), print the results and exit — costs real OpenRouter credit")
+	flag.Parse()
+
 	logFile := setupLogging()
 	if logFile != nil {
 		defer logFile.Close()
@@ -120,7 +124,7 @@ func main() {
 	// later launch, the cached device ID from device.id is reused as-is
 	// (it never changes/regenerates) and this popup is skipped — the ID
 	// is still printed above and in the log on every run either way.
-	if isNew {
+	if isNew && *evalPath == "" {
 		log.Println("this is a freshly generated device ID (first-ever launch) — opening pairing page")
 		ShowPairingUI(deviceID)
 	} else {
@@ -175,6 +179,14 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
+
+	if *evalPath != "" {
+		go func() {
+			RunEval(*evalPath, state, deviceID)
+			sigCh <- os.Interrupt
+		}()
+	}
+
 	<-sigCh
 
 	log.Println("shutting down")
