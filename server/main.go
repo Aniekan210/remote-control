@@ -316,6 +316,16 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
+			// A step that still isn't done after maxExecutorCallsPerStep
+			// executor calls won't be fixed by a fourth: the plan is off.
+			if !task.Context && task.InstrAttempts >= maxExecutorCallsPerStep {
+				srvLogf("device=%s: instruction %d not done after %d executor calls, replanning",
+					taskID, task.CurrentInstructionIndex, task.InstrAttempts)
+				task = requestReplan(task, fmt.Sprintf("Step %d (%q) still wasn't done after %d attempts.",
+					task.CurrentInstructionIndex+1, task.InstructionList[task.CurrentInstructionIndex], task.InstrAttempts))
+				break
+			}
+
 			key, haveKey := taskKeys[taskID]
 
 			// Release the lock before the network call so a slow request
@@ -401,6 +411,8 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				task.InstructionList = instructions
 				task.CurrentInstructionIndex = 0
 				task.Context = false // next ADVANCE generates executions, not a new plan
+				task.Reason = ""
+				task.InstrAttempts = 0
 				srvLogf("device=%s: plan set, %d instructions: %v", taskID, len(instructions), instructions)
 
 				// An empty plan means there's nothing to execute. Mark the
@@ -414,21 +426,16 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				}
 
 			default:
-				// Execution call: result is the execution list for
-				// the current instruction.
-				executions, ok := result.([]Execution)
+				// Execution call: result is the executor's verdict on the
+				// screen for the current instruction.
+				res, ok := result.(ExecResult)
 				if !ok {
-					srvLogf("device=%s: expected []Execution from execution call, got %T (value: %+v) — resetting task",
+					srvLogf("device=%s: expected ExecResult from execution call, got %T (value: %+v) — resetting task",
 						taskID, result, result)
 					task = resetTask(task.DeviceID)
 					break
 				}
-
-				task.ExecutionList = executions
-				task.CurrentInstructionIndex++
-
-				srvLogf("device=%s: execution list set (%d actions) for instruction %d/%d: %+v",
-					taskID, len(executions), task.CurrentInstructionIndex, len(task.InstructionList), executions)
+				task = applyExecResult(task, res)
 			}
 
 		case "PAUSE_TASK":
@@ -474,6 +481,71 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 		// Network I/O happens AFTER releasing the mutex.
 		broadcastToTaskRoom(r.Context(), taskID, task, clients)
 	}
+}
+
+// maxExecutorCallsPerStep caps executor calls on one instruction (an "act"
+// with instruction_done=false asks for another look); past it, replan.
+const maxExecutorCallsPerStep = 3
+
+// applyExecResult applies the executor's verdict for the current step:
+//   - act:     hand the worker the actions; move to the next step only if
+//     the executor says they finish this one (otherwise the next ADVANCE
+//     gets another executor call on the same step)
+//   - skip:    the step is already done — next step, nothing to run (the
+//     worker sees an empty list and just sends a plain ADVANCE)
+//   - replan:  off-plan but achievable — revise the plan
+//   - blocked: can't be done as asked — ask the user
+func applyExecResult(t Task, res ExecResult) Task {
+	switch res.Verdict {
+	case verdictAct:
+		t.ExecutionList = res.Actions
+		if res.InstructionDone {
+			t.CurrentInstructionIndex++
+			t.InstrAttempts = 0
+		} else {
+			t.InstrAttempts++
+		}
+		srvLogf("device=%s: executor act: %d actions for instruction %d/%d (done=%v): %+v",
+			t.DeviceID, len(res.Actions), t.CurrentInstructionIndex, len(t.InstructionList), res.InstructionDone, res.Actions)
+
+	case verdictSkip:
+		t.ExecutionList = make([]Execution, 0)
+		t.CurrentInstructionIndex++
+		t.InstrAttempts = 0
+		srvLogf("device=%s: executor skip: instruction already done on screen, now %d/%d",
+			t.DeviceID, t.CurrentInstructionIndex, len(t.InstructionList))
+
+	case verdictReplan:
+		srvLogf("device=%s: executor replan: %s", t.DeviceID, res.Reason)
+		t = requestReplan(t, res.Reason)
+
+	case verdictBlocked:
+		srvLogf("device=%s: executor blocked: %s", t.DeviceID, res.Reason)
+		t = askUser(t, "blocked", res.Reason)
+	}
+	return t
+}
+
+// requestReplan asks the worker for fresh context so the planner can
+// revise the plan: RUNNING with an empty list and Context=true makes the
+// worker send a context ADVANCE (screenshot + filesystem).
+func requestReplan(t Task, reason string) Task {
+	t.Context = true
+	t.ExecutionList = make([]Execution, 0)
+	t.Reason = reason
+	t.InstrAttempts = 0
+	t.Status = "RUNNING"
+	return t
+}
+
+// askUser parks the task on a question for the user. The worker idles
+// (Status != RUNNING) until an answer or a cancel arrives.
+func askUser(t Task, kind, question string) Task {
+	t.Status = "NEEDS_INPUT"
+	t.Question = question
+	t.QuestionKind = kind
+	t.ExecutionList = make([]Execution, 0)
+	return t
 }
 
 // taskCapReached returns a user-facing explanation when the task has hit

@@ -130,32 +130,58 @@ var planSchema = map[string]any{
 	"additionalProperties": false,
 }
 
+// executionActionSchema is one physical action: exactly the five
+// Execution fields, coordinates as single integers.
+var executionActionSchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"type": map[string]any{
+			"type": "string",
+			"enum": []string{"MOUSE_MOVEMENT", "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT"},
+		},
+		"mouse_pos_x": map[string]any{"type": "integer"},
+		"mouse_pos_y": map[string]any{"type": "integer"},
+		"key_string":  map[string]any{"type": "string"},
+		"mouse_hold":  map[string]any{"type": "boolean"},
+	},
+	"required":             []string{"type", "mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold"},
+	"additionalProperties": false,
+}
+
 // executionSchema is the strict structured-output schema for the executor:
-// exactly the five Execution fields, coordinates as single integers.
+// a verdict on the screen, plus the actions when the verdict is "act".
 var executionSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
-		"response": map[string]any{
-			"type": "array",
-			"items": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"type": map[string]any{
-						"type": "string",
-						"enum": []string{"MOUSE_MOVEMENT", "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT"},
-					},
-					"mouse_pos_x": map[string]any{"type": "integer"},
-					"mouse_pos_y": map[string]any{"type": "integer"},
-					"key_string":  map[string]any{"type": "string"},
-					"mouse_hold":  map[string]any{"type": "boolean"},
-				},
-				"required":             []string{"type", "mouse_pos_x", "mouse_pos_y", "key_string", "mouse_hold"},
-				"additionalProperties": false,
-			},
+		"verdict": map[string]any{
+			"type": "string",
+			"enum": []string{"act", "skip", "replan", "blocked"},
+		},
+		"reason":           map[string]any{"type": "string"},
+		"instruction_done": map[string]any{"type": "boolean"},
+		"actions": map[string]any{
+			"type":  "array",
+			"items": executionActionSchema,
 		},
 	},
-	"required":             []string{"response"},
+	"required":             []string{"verdict", "reason", "instruction_done", "actions"},
 	"additionalProperties": false,
+}
+
+// Executor verdicts (see the executor prompt).
+const (
+	verdictAct     = "act"     // run Actions; advance only if InstructionDone
+	verdictSkip    = "skip"    // the step is already done on screen
+	verdictReplan  = "replan"  // off-plan but achievable: revise the plan
+	verdictBlocked = "blocked" // can't be done as asked: ask the user
+)
+
+// ExecResult is the executor's judgement of the screen for one step.
+type ExecResult struct {
+	Verdict         string
+	Reason          string
+	InstructionDone bool
+	Actions         []Execution
 }
 
 // callPlanner asks the planner to break the task into instructions.
@@ -215,7 +241,8 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 	w := action.ScreenshotPayload.Width
 	h := action.ScreenshotPayload.Height
 
-	instruction := task.InstructionList[task.CurrentInstructionIndex]
+	idx := task.CurrentInstructionIndex
+	instruction := task.InstructionList[idx]
 
 	aiLogf("[%s] execution request: instruction=%q screenshot=%dx%d imageBytes=%d",
 		callID, instruction, w, h, len(action.ScreenshotPayload.Data))
@@ -230,10 +257,7 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 	userContent := []any{
 		map[string]any{
 			"type": "text",
-			"text": fmt.Sprintf(
-				"Instruction: %s\n\nScreenshot size: %dx%d pixels (0 <= x < %d, 0 <= y < %d).",
-				instruction, w, h, w, h,
-			),
+			"text": executorUserText(task, instruction, idx, w, h),
 		},
 		screenshotContent(action.ScreenshotPayload),
 	}
@@ -246,41 +270,115 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 		return nil, cost, err
 	}
 
-	var executions struct {
-		Response []Execution `json:"response"`
+	res, err := parseExecResult(response)
+	if err != nil {
+		aiLogf("[%s] FAILED invalid execution result: %v, cleaned response: %s", callID, err, response)
+		return nil, cost, fmt.Errorf("invalid execution result: %w (raw: %s)", err, response)
 	}
 
-	if err := json.Unmarshal([]byte(response), &executions); err != nil {
-		aiLogf("[%s] FAILED invalid execution list: %v, cleaned response: %s", callID, err, response)
-		return nil, cost, fmt.Errorf("invalid execution list: %w (raw: %s)", err, response)
-	}
+	aiLogf("[%s] SUCCESS execution: verdict=%s done=%v reason=%q %d actions: %+v",
+		callID, res.Verdict, res.InstructionDone, res.Reason, len(res.Actions), res.Actions)
 
-	// Validate the decoded actions. This is the safety net for the failure
-	// that silently produced six empty actions before: json.Unmarshal does
-	// NOT error when the model uses the wrong field names (e.g. "action"/
-	// "x"/"y"/"text" instead of "type"/"mouse_pos_x"/...) — it just leaves
-	// every field at its zero value. An action with an empty/unknown Type is
-	// that exact symptom, so we reject it here and let the caller retry
-	// (with the corrected, schema-explicit prompt) instead of sending the
-	// worker a list of no-op clicks at (0,0).
-	if len(executions.Response) == 0 {
-		aiLogf("[%s] FAILED model returned an empty execution list, cleaned response: %s", callID, response)
-		return nil, cost, fmt.Errorf("empty execution list (raw: %s)", response)
+	return res, cost, nil
+}
+
+// executorUserText is the dynamic part of an executor call: the step to
+// carry out, plus the context needed to judge whether the screen is where
+// the plan expects (E3): the overall task, the whole plan with the current
+// step marked, the previous step, and the user's answers so far.
+func executorUserText(task Task, instruction string, idx int, w, h uint32) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Instruction: %s\n\n", instruction)
+	fmt.Fprintf(&b, "Overall task: %s\n\n", task.Description)
+	b.WriteString("Plan:\n")
+	for i, step := range task.InstructionList {
+		marker := "   "
+		if i == idx {
+			marker = "-> "
+		}
+		fmt.Fprintf(&b, "%s%d. %s\n", marker, i+1, step)
 	}
-	for i, e := range executions.Response {
-		switch e.Type {
-		case "MOUSE_MOVEMENT", "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT":
-			// valid
-		default:
-			aiLogf("[%s] FAILED execution %d has invalid/empty type %q — the model almost certainly used the wrong JSON field names (expected type/mouse_pos_x/mouse_pos_y/key_string/mouse_hold); cleaned response: %s",
-				callID, i, e.Type, response)
-			return nil, cost, fmt.Errorf("execution %d has invalid/empty type %q (raw: %s)", i, e.Type, response)
+	if idx > 0 && idx-1 < len(task.InstructionList) {
+		fmt.Fprintf(&b, "\nPrevious step: %s\n", task.InstructionList[idx-1])
+	} else {
+		b.WriteString("\nPrevious step: (none — this is the first step)\n")
+	}
+	if len(task.Answers) > 0 {
+		b.WriteString("\nUser's answers so far:\n")
+		for _, a := range task.Answers {
+			fmt.Fprintf(&b, "- %s\n", a)
 		}
 	}
+	fmt.Fprintf(&b, "\nScreenshot size: %dx%d pixels (0 <= x < %d, 0 <= y < %d).", w, h, w, h)
+	return b.String()
+}
 
-	aiLogf("[%s] SUCCESS execution: %d actions: %+v", callID, len(executions.Response), executions.Response)
+// parseExecResult decodes and validates the executor's output. It is
+// tolerant of the pre-verdict shape ({"response": [...]}), read as "act,
+// step done", so a model that ignores the schema still works.
+//
+// Validation is the safety net for the failure that once silently produced
+// six empty actions: json.Unmarshal does NOT error when the model uses the
+// wrong field names (e.g. "action"/"x"/"y"/"text" instead of
+// "type"/"mouse_pos_x"/...) — it just leaves every field at its zero value.
+// An action with an empty/unknown Type is that exact symptom, so it's
+// rejected here and the caller retries, instead of sending the worker a
+// list of no-op clicks at (0,0).
+func parseExecResult(response string) (ExecResult, error) {
+	var raw struct {
+		Verdict         string      `json:"verdict"`
+		Reason          string      `json:"reason"`
+		InstructionDone *bool       `json:"instruction_done"`
+		Actions         []Execution `json:"actions"`
+		Response        []Execution `json:"response"` // legacy shape
+	}
+	if err := json.Unmarshal([]byte(response), &raw); err != nil {
+		return ExecResult{}, err
+	}
 
-	return executions.Response, cost, nil
+	res := ExecResult{
+		Verdict: strings.ToLower(strings.TrimSpace(raw.Verdict)),
+		Reason:  strings.TrimSpace(raw.Reason),
+		Actions: raw.Actions,
+	}
+	if len(res.Actions) == 0 && len(raw.Response) > 0 {
+		res.Actions = raw.Response
+	}
+	if res.Verdict == "" && len(res.Actions) > 0 {
+		res.Verdict = verdictAct
+	}
+	// A missing instruction_done means the old one-call-per-step contract.
+	res.InstructionDone = raw.InstructionDone == nil || *raw.InstructionDone
+
+	switch res.Verdict {
+	case verdictAct:
+		if len(res.Actions) == 0 {
+			if res.InstructionDone {
+				// Nothing to do and the step is done: that's a skip.
+				res.Verdict = verdictSkip
+				return res, nil
+			}
+			return ExecResult{}, fmt.Errorf("verdict act with no actions")
+		}
+		for i, e := range res.Actions {
+			switch e.Type {
+			case "MOUSE_MOVEMENT", "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT":
+				// valid
+			default:
+				return ExecResult{}, fmt.Errorf("execution %d has invalid/empty type %q — the model almost certainly used the wrong JSON field names (expected type/mouse_pos_x/mouse_pos_y/key_string/mouse_hold)", i, e.Type)
+			}
+		}
+	case verdictSkip:
+		res.Actions = nil
+	case verdictReplan, verdictBlocked:
+		res.Actions = nil
+		if res.Reason == "" {
+			res.Reason = "The screen isn't what the plan expected."
+		}
+	default:
+		return ExecResult{}, fmt.Errorf("unknown verdict %q", raw.Verdict)
+	}
+	return res, nil
 }
 
 // screenshotContent wraps a screenshot as an OpenAI-style image part.
