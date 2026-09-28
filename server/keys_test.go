@@ -20,3 +20,17 @@ func TestDecryptAPIKeyMatchesWebApp(t *testing.T) {
 		t.Fatal("decrypting with the wrong secret must fail")
 	}
 }
+
+func TestCleanDatabaseURL(t *testing.T) {
+	want := "postgresql://u:p@ep-x.neon.tech/neondb?sslmode=require"
+	for _, in := range []string{
+		want,
+		"  " + want + "\n",
+		`"` + want + `"`,
+		"psql '" + want + "'",
+	} {
+		if got := cleanDatabaseURL(in); got != want {
+			t.Errorf("cleanDatabaseURL(%q) = %q", in, got)
+		}
+	}
+}

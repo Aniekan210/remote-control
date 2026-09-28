@@ -33,24 +33,73 @@ type apiKey struct {
 
 var db *pgxpool.Pool
 
+// dbErr is set when DATABASE_URL is set but unusable. Then no task can
+// start (see resolveAPIKey): quietly falling back to "everyone runs on the
+// server's key" would let anyone spend it.
+var dbErr error
+
 // initDB connects to DATABASE_URL (the same Neon database as the web app).
 // Without it, per-user keys can't be looked up and every task runs on the
 // server's key, as before BYO keys existed.
 func initDB() {
-	url := os.Getenv("DATABASE_URL")
-	if url == "" {
+	raw, set := os.LookupEnv("DATABASE_URL")
+	url := cleanDatabaseURL(raw)
+	if !set || (url == "" && strings.TrimSpace(raw) == "") {
+		if set {
+			dbErr = errors.New("DATABASE_URL is set but empty")
+			srvLogf("ERROR: DATABASE_URL is set but empty — no task can start until it holds the Neon connection string (postgresql://user:password@ep-....neon.tech/neondb?sslmode=require)")
+			return
+		}
 		srvLogf("WARNING: DATABASE_URL is not set — per-user OpenRouter keys are disabled and EVERY task runs on the server's key")
 		return
 	}
+
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		dbErr = fmt.Errorf("DATABASE_URL can't be parsed: %w", err)
+		srvLogf("ERROR: DATABASE_URL can't be parsed (%v) — no task can start. It should be the bare Neon connection string: postgresql://user:password@ep-....neon.tech/neondb?sslmode=require", err)
+		return
+	}
+	// Neon's connection strings end with channel_binding=require, which
+	// this pgx version doesn't implement: it would pass it on to the server
+	// as a session setting, and the server rejects the connection over it.
+	// sslmode=require still encrypts the connection.
+	delete(cfg.ConnConfig.RuntimeParams, "channel_binding")
+
+	host, database := cfg.ConnConfig.Host, cfg.ConnConfig.Database
+	if host == "" || strings.HasPrefix(host, "/") || database == "" {
+		// What an empty or mangled value parses to: the driver's defaults,
+		// a local Unix socket and no database — never what's meant here.
+		dbErr = fmt.Errorf("DATABASE_URL has no host or database (host=%q database=%q)", host, database)
+		srvLogf("ERROR: DATABASE_URL has no host or database (parsed host=%q database=%q) — no task can start. It should be the bare Neon connection string: postgresql://user:password@ep-....neon.tech/neondb?sslmode=require (no quotes, no \"psql\")", host, database)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, url)
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
-		srvLogf("WARNING: could not connect to DATABASE_URL: %v — per-user OpenRouter keys are disabled", err)
+		dbErr = fmt.Errorf("can't set up the database pool: %w", err)
+		srvLogf("ERROR: could not set up DATABASE_URL (host=%s database=%s): %v — no task can start", host, database, err)
 		return
 	}
 	db = pool
-	srvLogf("database connected (per-user OpenRouter keys enabled)")
+	if err := pool.Ping(ctx); err != nil {
+		// Could be a blip (Neon waking up): keep the pool, it retries per query.
+		srvLogf("WARNING: database at host=%s database=%s isn't answering yet: %v — will keep trying", host, database, err)
+		return
+	}
+	srvLogf("database connected: host=%s database=%s (per-user OpenRouter keys enabled)", host, database)
+}
+
+// cleanDatabaseURL forgives the usual paste mistakes: surrounding spaces or
+// newlines, quotes, and Neon's "psql '...'" copy button format.
+func cleanDatabaseURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	if strings.HasPrefix(s, "psql ") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "psql "))
+	}
+	return strings.TrimSpace(strings.Trim(s, `"'`))
 }
 
 // ownerUserIDs parses OWNER_USER_IDS (comma-separated web-app user IDs).
@@ -68,11 +117,17 @@ func ownerUserIDs() map[string]bool {
 // owner; its message is shown to the user as last_error.
 var errNoKey = errors.New("Add your OpenRouter key in Settings")
 
+// errDBMisconfigured means DATABASE_URL is set but unusable (see initDB).
+var errDBMisconfigured = errors.New("the server's database isn't configured correctly")
+
 // resolveAPIKey finds the key to bill a new task on this device to:
 // device -> user -> that user's saved key; owners without a key of their
 // own use the server's key.
 func resolveAPIKey(ctx context.Context, deviceID string) (apiKey, error) {
 	serverKey := apiKey{value: os.Getenv("OPENROUTER_API_KEY"), serverKey: true}
+	if dbErr != nil {
+		return apiKey{}, fmt.Errorf("%w: %v", errDBMisconfigured, dbErr)
+	}
 	if db == nil {
 		return serverKey, nil
 	}

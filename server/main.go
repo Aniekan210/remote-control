@@ -257,6 +257,9 @@ func checkCanStart(ctx context.Context, deviceID string) (apiKey, string) {
 		if errors.Is(err, errNoKey) {
 			return apiKey{}, errNoKey.Error()
 		}
+		if errors.Is(err, errDBMisconfigured) {
+			return apiKey{}, "The server can't use its database (check DATABASE_URL in the server's settings)."
+		}
 		return apiKey{}, "Couldn't look up your OpenRouter key. Try again."
 	}
 	if spent := costs.serverMonthTotal(); key.serverKey && spent >= limits.MonthlyBudgetUSD {
