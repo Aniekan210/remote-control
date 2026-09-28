@@ -177,6 +177,15 @@ func main() {
 		log.Println("human-takeover pause disabled via REMOTE_WORKER_NO_TAKEOVER=1")
 	}
 
+	// Kill switch on the laptop itself: Ctrl+Alt+Shift+X cancels the
+	// current task even if the phone is offline (see hotkey.go).
+	go RunCancelHotkey(func() {
+		CancelLocally(state.LastTask().Seq)
+		takeover.ServerResume() // release a takeover hold so the executor sees the cancel and stops
+		pushOverlay(overlayUpdates, OverlayState{Visible: false})
+		go SendAction(state, Action{Type: "CANCEL_TASK", DeviceID: deviceID})
+	})
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -81,13 +82,33 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 	// already did this; the ADVANCE may have been dropped": send the
 	// ADVANCE again, but never replay the actions.
 	lastSeq := 0
+	resentCancel := -1
 
 	for change := range changes {
 		cur := change.Cur
 
+		if cur.Status == "NONE" {
+			// The server has reset the task (cancelled from anywhere, or a
+			// server restart): a local hotkey cancel has done its job.
+			clearLocalCancel()
+		}
+
 		overlay <- overlayStateFor(cur)
 
 		if cur.Status != "RUNNING" {
+			continue
+		}
+
+		// Cancelled from the laptop with the hotkey: do nothing more for
+		// this task, even if the server hasn't heard yet (offline phone or
+		// server). Once connected again, make sure the server knows.
+		if cancelledLocally(cur.Seq) {
+			if resentCancel != cur.Seq {
+				resentCancel = cur.Seq
+				log.Printf("executor: task seq=%d was cancelled with the hotkey — telling the server again", cur.Seq)
+				go SendAction(state, Action{Type: "CANCEL_TASK", DeviceID: deviceID})
+			}
+			pushOverlay(overlay, OverlayState{Visible: false})
 			continue
 		}
 
@@ -122,7 +143,9 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 				sendAdvance(state, deviceID, false, "", fsStore, err.Error(), cur.Seq)
 				continue
 			}
-			executeList(execs, overlay, overlayStateFor(cur))
+			if !executeList(execs, overlay, overlayStateFor(cur), cur.Seq) {
+				continue // cancelled with the hotkey mid-batch
+			}
 			sendAdvance(state, deviceID, false, "", fsStore, "", cur.Seq)
 			continue
 		}
@@ -240,7 +263,10 @@ func sendAdvance(state *State, deviceID string, includeFS bool, query string, fs
 // ActionText ("Typing ...", "Click (x,y)", ...) built on top of `base`
 // (the step-level state for this instruction), so the panel shows the
 // most granular thing possible: what the machine is doing at this instant.
-func executeList(execs []Execution, overlay chan<- OverlayState, base OverlayState) {
+//
+// It returns false if the task was cancelled with the hotkey part-way
+// (seq is the task state the list belongs to); the rest is not run.
+func executeList(execs []Execution, overlay chan<- OverlayState, base OverlayState, seq int) bool {
 	leftHeld := false
 	rightHeld := false
 
@@ -248,6 +274,17 @@ func executeList(execs []Execution, overlay chan<- OverlayState, base OverlaySta
 		// If the human has taken over the mouse, block here until it's clear
 		// to proceed — so the worker never fights the person for the cursor.
 		takeover.Gate()
+
+		if cancelledLocally(seq) {
+			log.Printf("executor: cancelled with the hotkey — stopping before action %d of %d", i+1, len(execs))
+			if leftHeld {
+				LeftUp()
+			}
+			if rightHeld {
+				RightUp()
+			}
+			return false
+		}
 
 		if txt := actionText(e); txt != "" {
 			st := base
@@ -317,7 +354,25 @@ func executeList(execs []Execution, overlay chan<- OverlayState, base OverlaySta
 	if rightHeld {
 		RightUp()
 	}
+	return true
 }
+
+// Local cancel (G1): the Ctrl+Alt+Shift+X hotkey stops the current task on
+// this machine at once, without waiting for the server — which may be
+// unreachable, or the phone offline. localCancelSeq holds the cancelled
+// task state's Seq+1 (0 = nothing cancelled); every state up to it is
+// treated as dead until the server resets the task.
+var localCancelSeq atomic.Int64
+
+// CancelLocally marks the task state with this Seq (and older) cancelled.
+func CancelLocally(seq int) { localCancelSeq.Store(int64(seq) + 1) }
+
+func cancelledLocally(seq int) bool {
+	c := localCancelSeq.Load()
+	return c > 0 && int64(seq) < c
+}
+
+func clearLocalCancel() { localCancelSeq.Store(0) }
 
 // settlesAfter reports whether an action usually opens or changes
 // something on screen ({WIN}, {ENTER}, a click or a drag's release), so the
