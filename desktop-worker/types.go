@@ -21,7 +21,7 @@ type Task struct {
 	// echoed in every ADVANCE); the rest are here so the JSON round-trips
 	// cleanly and so state changes are seen in full.
 	Seq            int      `json:"seq"`
-	Reason         string   `json:"reason"`
+	Reason         string   `json:"reason"` // non-empty while the server is revising the plan (see isUserResumeSignal)
 	Question       string   `json:"question"`
 	QuestionKind   string   `json:"question_kind"`
 	QuestionImage  string   `json:"question_image"`
@@ -47,6 +47,10 @@ type Action struct {
 	Description       string      `json:"description,omitempty"`
 	FileSystemPayload []FileEntry `json:"file_system_payload,omitempty"`
 	ScreenshotPayload Screenshot  `json:"screenshot_payload"`
+	// Error, on ADVANCE, reports that the last step couldn't be carried
+	// out here (screenshot failed twice, coordinates off the screen, an
+	// unknown action type). The server treats it as a replan.
+	Error string `json:"error,omitempty"`
 }
 
 type FileEntry struct {

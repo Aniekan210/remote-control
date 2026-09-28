@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -68,36 +69,80 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 		}
 
 		if len(cur.ExecutionList) > 0 {
+			// Refuse the whole list up front if any action can't be
+			// carried out (bad coordinates, unknown type): half-running
+			// a batch leaves the screen in a state nobody planned for.
+			// The error goes back to the server, which revises the plan.
+			if err := validateExecutions(cur.ExecutionList); err != nil {
+				log.Printf("executor: refusing execution list: %v", err)
+				sendAdvance(state, deviceID, false, "", fsStore, err.Error())
+				continue
+			}
 			executeList(cur.ExecutionList, overlay, overlayStateFor(cur))
-			sendAdvance(state, deviceID, false, "", fsStore)
+			sendAdvance(state, deviceID, false, "", fsStore, "")
 			continue
 		}
 
-		// Our turn to ask for the next step. Only attach the filesystem
-		// snapshot on the very first ADVANCE of a task (Context == true).
-		sendAdvance(state, deviceID, cur.Context, cur.Description, fsStore)
+		// Our turn to ask for the next step. The filesystem snapshot is
+		// attached whenever Context is true (a plan or a revise is next).
+		sendAdvance(state, deviceID, cur.Context, fsQuery(cur), fsStore, "")
 	}
+}
+
+// fsQuery is the text the filesystem snapshot is filtered against: the
+// task, plus why the plan is being revised and what the user answered.
+func fsQuery(t Task) string {
+	return strings.Join(append([]string{t.Description, t.Reason}, t.Answers...), " ")
+}
+
+// validateExecutions checks every action can actually be performed here:
+// a known type, and mouse coordinates on the (primary) screen.
+func validateExecutions(execs []Execution) error {
+	w, h := screenSize()
+	for i, e := range execs {
+		switch e.Type {
+		case "MOUSE_MOVEMENT":
+			if w > 0 && h > 0 && (e.MousePosX < 0 || e.MousePosY < 0 || e.MousePosX >= w || e.MousePosY >= h) {
+				return fmt.Errorf("action %d: coordinates (%d, %d) are outside the %dx%d screen", i+1, e.MousePosX, e.MousePosY, w, h)
+			}
+		case "LEFT_CLICK", "RIGHT_CLICK", "KEYBOARD_INPUT":
+		default:
+			return fmt.Errorf("action %d: unknown action type %q", i+1, e.Type)
+		}
+	}
+	return nil
 }
 
 // sendAdvance captures the settled screen and sends ADVANCE. When includeFS
 // is set it attaches the filtered filesystem snapshot, using query (the
-// task description) to pick which entries are relevant.
-func sendAdvance(state *State, deviceID string, includeFS bool, query string, fsStore *SnapshotStore) {
+// task text) to pick which entries are relevant. workerErr, if set, tells
+// the server the last step couldn't be carried out here.
+func sendAdvance(state *State, deviceID string, includeFS bool, query string, fsStore *SnapshotStore, workerErr string) {
 	// Don't capture or advance while the human is driving the mouse.
 	takeover.Gate()
 
 	// Wait for the screen to settle before capturing, so the next step is
 	// planned against a fully-rendered screen rather than a mid-load one.
+	// A failed capture is retried once; if it fails again the server is
+	// told (instead of the task silently stalling here forever).
 	shot, err := CaptureStableScreen(settleInitial, settlePoll, settleMax)
 	if err != nil {
-		log.Printf("executor: screenshot failed: %v", err)
-		return
+		log.Printf("executor: screenshot failed: %v — retrying once", err)
+		time.Sleep(500 * time.Millisecond)
+		shot, err = CaptureStableScreen(settleInitial, settlePoll, settleMax)
+	}
+	if err != nil {
+		log.Printf("executor: screenshot failed twice: %v — reporting it to the server", err)
+		if workerErr == "" {
+			workerErr = "taking a screenshot failed twice: " + err.Error()
+		}
 	}
 
 	action := Action{
 		Type:              "ADVANCE",
 		DeviceID:          deviceID,
 		ScreenshotPayload: shot,
+		Error:             workerErr,
 	}
 	if includeFS {
 		snap := fsStore.Snapshot(query)
@@ -173,6 +218,7 @@ func executeList(execs []Execution, overlay chan<- OverlayState, base OverlaySta
 			TypeText(e.KeyString)
 
 		default:
+			// validateExecutions rejects these before anything runs.
 			log.Printf("executor: unknown execution type %q", e.Type)
 		}
 

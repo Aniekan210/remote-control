@@ -120,15 +120,23 @@ func readLoop(ctx context.Context, conn *websocket.Conn, state *State, changes c
 
 // isUserResumeSignal reports whether a task update reflects an explicit
 // person-driven command (rather than automatic task progression):
-//   - resuming a paused task (PAUSED -> RUNNING),
+//   - resuming a paused task, or answering a question
+//     (PAUSED or NEEDS_INPUT -> RUNNING),
 //   - cancelling / resetting a task (-> NONE or CANCELLED),
-//   - starting a fresh task (a new plan: RUNNING with Context still true).
+//   - starting a brand-new task (Context with no plan yet and no Reason).
+//
+// Context alone is NOT enough: the server also sets it for an automatic
+// revise (Reason set, plan non-empty), and treating that as a resume
+// would clear a takeover hold behind the user's back on every revise.
 func isUserResumeSignal(prev, cur Task) bool {
 	switch cur.Status {
 	case "NONE", "CANCELLED":
 		return true
 	case "RUNNING":
-		if prev.Status == "PAUSED" || cur.Context {
+		if prev.Status == "PAUSED" || prev.Status == "NEEDS_INPUT" {
+			return true
+		}
+		if cur.Context && len(cur.InstructionList) == 0 && cur.Reason == "" {
 			return true
 		}
 	}

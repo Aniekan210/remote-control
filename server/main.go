@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -278,6 +279,16 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 				taskID, task.Context, task.CurrentInstructionIndex, len(task.InstructionList),
 				len(action.ScreenshotPayload.Data), len(action.FileSystemPayload))
 
+			// The worker couldn't do what it was told (the screenshot
+			// failed twice, coordinates off the screen, an action type it
+			// doesn't know). That's the screen not matching the plan, as
+			// far as recovery goes: revise it, no executor call.
+			if action.Error != "" {
+				srvLogf("device=%s: worker reported an error, replanning: %s", taskID, action.Error)
+				task = requestReplan(task, "The computer couldn't carry out the last step: "+action.Error)
+				break
+			}
+
 			// If the worker has just finished the final execution,
 			// this ADVANCE means the task is now actually complete.
 			// Do not make another AI call.
@@ -528,14 +539,32 @@ func applyExecResult(t Task, res ExecResult) Task {
 
 // requestReplan asks the worker for fresh context so the planner can
 // revise the plan: RUNNING with an empty list and Context=true makes the
-// worker send a context ADVANCE (screenshot + filesystem).
+// worker send a context ADVANCE (screenshot + filesystem), and the planner
+// then revises. Automatic revises are capped (MAX_AUTO_REPLANS): past the
+// cap the system is going in circles, so it asks the user instead.
 func requestReplan(t Task, reason string) Task {
+	if t.AutoReplans+1 > limits.MaxAutoReplans {
+		srvLogf("device=%s: %d automatic revises already, asking the user instead", t.DeviceID, t.AutoReplans)
+		return askUser(t, "blocked", fmt.Sprintf(
+			"I've tried to recover %d times and I'm still stuck: %s What should I do?",
+			t.AutoReplans, sentence(reason)))
+	}
+	t.AutoReplans++
 	t.Context = true
 	t.ExecutionList = make([]Execution, 0)
 	t.Reason = reason
 	t.InstrAttempts = 0
 	t.Status = "RUNNING"
 	return t
+}
+
+// sentence trims s and makes sure it ends like a sentence.
+func sentence(s string) string {
+	s = strings.TrimSpace(s)
+	if s != "" && !strings.ContainsAny(s[len(s)-1:], ".!?") {
+		s += "."
+	}
+	return s
 }
 
 // askUser parks the task on a question for the user. The worker idles

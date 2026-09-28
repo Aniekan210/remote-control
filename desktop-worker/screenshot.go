@@ -56,6 +56,14 @@ type bitmapInfoHeader struct {
 	ClrImportant  uint32
 }
 
+// screenSize returns the primary display's size in real pixels (the
+// process is DPI-aware), or 0,0 if it can't be read.
+func screenSize() (w, h int) {
+	width, _, _ := procGetSystemMetrics.Call(uintptr(smCxScreen))
+	height, _, _ := procGetSystemMetrics.Call(uintptr(smCyScreen))
+	return int(int32(width)), int(int32(height))
+}
+
 // captureImage grabs the primary display into an *image.RGBA. This is the
 // raw capture; PNG encoding and stability polling are layered on top.
 func captureImage() (*image.RGBA, error) {

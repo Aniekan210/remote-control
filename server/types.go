@@ -58,6 +58,7 @@ type Action struct {
 	Description       string      `json:"description"`         // for CREATE_TASK
 	FileSystemPayload []FileEntry `json:"file_system_payload"` // for ADVANCE
 	ScreenshotPayload Screenshot  `json:"screenshot_payload"`
+	Error             string      `json:"error"` // for ADVANCE: the worker couldn't carry out the last step (screenshot failed, bad coordinates, unknown action)
 }
 
 type FileEntry struct {
