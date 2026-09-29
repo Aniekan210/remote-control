@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,11 +32,13 @@ const (
 	// structured reasoner with strong vision. Overridable via PLANNING_MODEL.
 	defaultPlanningModel = "google/gemini-3.1-pro-preview"
 
-	// EXECUTION is a visual-grounding job (turn one instruction + the
-	// screenshot into exact click pixels). Qwen2.5-VL is grounding-first —
-	// coordinate/point output is a trained capability, not an afterthought
-	// — which is exactly what pixel-accurate clicking needs.
-	defaultExecutionModel = "qwen/qwen2.5-vl-72b-instruct"
+	// EXECUTION is the step-by-step job: judge whether the screen is where
+	// the plan expects, then turn one instruction + the screenshot into
+	// exact clicks and keystrokes. Qwen3-VL is built for GUI agent work —
+	// much better at that judgement than Qwen2.5-VL, and cheaper on
+	// OpenRouter. It grounds in 0–1000 normalized coordinates, which
+	// executionCoords picks automatically. Overridable via EXECUTION_MODEL.
+	defaultExecutionModel = "qwen/qwen3-vl-235b-a22b-instruct"
 )
 
 // Planner output limits (B5). Reasoning tokens are billed as output tokens
@@ -57,11 +60,22 @@ const (
 type callOptions struct {
 	maxTokens       int
 	reasoningEffort string
+	temperature     *float64
 }
 
-// plannerOptions returns the planner's output limits.
-func plannerOptions() callOptions {
+// plannerOptions returns the planner's output limits. A revise — the
+// plan has already gone wrong once — gets more thinking (medium effort,
+// REVISE_REASONING_EFFORT) and room for it: recovering well mid-task is
+// where accuracy is won or lost, and it's a handful of calls per task.
+func plannerOptions(revise bool) callOptions {
 	opts := callOptions{maxTokens: defaultPlannerMaxTokens, reasoningEffort: defaultPlannerReasoningEffort}
+	if revise {
+		opts.maxTokens = 2 * defaultPlannerMaxTokens
+		opts.reasoningEffort = "medium"
+		if v := os.Getenv("REVISE_REASONING_EFFORT"); v != "" {
+			opts.reasoningEffort = v
+		}
+	}
 	if v := os.Getenv("PLANNER_MAX_TOKENS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			opts.maxTokens = n
@@ -86,11 +100,35 @@ const (
 	coordsNorm1000 = "norm1000"
 )
 
+// executionCoords is EXECUTION_COORDS if set, else what the executor model
+// is known to use: Qwen3-VL answers in 0–1000 normalized coordinates,
+// Qwen2.5-VL (and most others) in pixels.
 func executionCoords() string {
-	if os.Getenv("EXECUTION_COORDS") == coordsNorm1000 {
+	switch os.Getenv("EXECUTION_COORDS") {
+	case coordsNorm1000:
+		return coordsNorm1000
+	case coordsPixels:
+		return coordsPixels
+	}
+	if strings.Contains(strings.ToLower(modelForContext(false)), "qwen3-vl") {
 		return coordsNorm1000
 	}
 	return coordsPixels
+}
+
+// executorOptions: the executor runs at temperature 0 (EXECUTOR_TEMPERATURE
+// overrides). Clicking the right pixel and following one step is a
+// precision job; OpenRouter's default of 1.0 made it wander — clicking
+// near things, or doing more than the step asked. No output cap: a long,
+// careful action list is worth more than the tokens it saves.
+func executorOptions() callOptions {
+	t := 0.0
+	if v := os.Getenv("EXECUTOR_TEMPERATURE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			t = f
+		}
+	}
+	return callOptions{temperature: &t}
 }
 
 // modelForContext returns the model for the current call. planning==true
@@ -203,6 +241,11 @@ var executionActionSchema = map[string]any{
 var executionSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
+		// observation and previous_step_ok come FIRST on purpose: the model
+		// writes fields in schema order, so it describes the screen and
+		// checks the last step before it commits to a verdict or a click.
+		"observation":      map[string]any{"type": "string"},
+		"previous_step_ok": map[string]any{"type": "boolean"},
 		"verdict": map[string]any{
 			"type": "string",
 			"enum": []string{"act", "skip", "replan", "blocked"},
@@ -214,7 +257,7 @@ var executionSchema = map[string]any{
 			"items": executionActionSchema,
 		},
 	},
-	"required":             []string{"verdict", "reason", "instruction_done", "actions"},
+	"required":             []string{"observation", "previous_step_ok", "verdict", "reason", "instruction_done", "actions"},
 	"additionalProperties": false,
 }
 
@@ -228,6 +271,8 @@ const (
 
 // ExecResult is the executor's judgement of the screen for one step.
 type ExecResult struct {
+	Observation     string // what it sees, in a sentence or two
+	PreviousStepOK  bool   // did the previous step visibly work?
 	Verdict         string
 	Reason          string
 	InstructionDone bool
@@ -270,7 +315,7 @@ func callPlanner(callID string, task Task, action Action, key apiKey) (any, floa
 	}
 
 	response, cost, err := callOpenRouter(callID, "PLANNING", modelForContext(true),
-		plannerSystemPrompt, userContent, "plan", planSchema, plannerOptions(), key)
+		plannerSystemPrompt, userContent, "plan", planSchema, plannerOptions(revise), key)
 	if err != nil {
 		return nil, cost, err
 	}
@@ -311,6 +356,16 @@ func reviseUserText(task Task, files []FileEntry, now time.Time) string {
 	for i := idx; i < len(task.InstructionList); i++ {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, task.InstructionList[i])
 	}
+	if len(task.History) > 0 {
+		b.WriteString("\nWhat actually happened (most recent last) — trust this over the step titles:\n")
+		from := max(len(task.History)-historyForRevise, 0)
+		if from > 0 {
+			fmt.Fprintf(&b, "(%d earlier entries omitted)\n", from)
+		}
+		for _, h := range task.History[from:] {
+			fmt.Fprintf(&b, "- %s\n", h)
+		}
+	}
 	if len(task.Answers) > 0 {
 		b.WriteString("\nUser's answers so far:\n")
 		for _, a := range task.Answers {
@@ -324,23 +379,19 @@ func reviseUserText(task Task, files []FileEntry, now time.Time) string {
 	return b.String()
 }
 
+// historyForRevise is how many of the latest history entries a revise sees.
+const historyForRevise = 30
+
 // mentionsFiles is a cheap check for whether a replan reason or an answer
 // is about files or folders — only then is the filesystem list (the
-// biggest part of a planning prompt) worth sending on a revise.
+// biggest part of a planning prompt) worth sending on a revise. It matches
+// whole words, so "profile" doesn't count as "file".
 func mentionsFiles(text string) bool {
-	t := strings.ToLower(text)
-	for _, w := range []string{
-		"file", "folder", "directory", "document", "download", "desktop",
-		"pictures", "photo", "screenshot", "attachment", "attach", "upload",
-		"save", "saved", "path", "drive", "explorer", "~\\", ":\\",
-		".pdf", ".doc", ".xls", ".ppt", ".txt", ".csv", ".png", ".jpg", ".jpeg", ".zip", ".mp3", ".mp4",
-	} {
-		if strings.Contains(t, w) {
-			return true
-		}
-	}
-	return false
+	return fileWords.MatchString(text)
 }
+
+var fileWords = regexp.MustCompile(`(?i)\b(files?|folders?|director(y|ies)|documents?|downloads?|desktop|pictures|photos?|screenshots?|attach(ed|ment|ments)?|upload(ed|s)?|saved?|explorer)\b` +
+	`|\.(pdf|docx?|xlsx?|pptx?|txt|csv|png|jpe?g|zip|mp3|mp4)\b|[a-z]:\\|~\\`)
 
 // callExecutor asks the executor for the physical actions that carry out
 // the current instruction.
@@ -387,16 +438,14 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 	userContent := []any{
 		map[string]any{
 			"type": "text",
-			"text": executorUserText(task, instruction, idx, w, h),
+			"text": executorUserText(task, instruction, idx, w, h, action.Clipboard),
 		},
 		screenshotContent(action.ScreenshotPayload),
 	}
 
-	// No output cap for the executor: it's cheap, and a long, careful action
-	// list is worth more than the tokens it saves to cut it short.
 	coords := executionCoords()
 	response, cost, err := callOpenRouter(callID, "EXECUTION", modelForContext(false),
-		executorPrompt(coords), userContent, "actions", executionSchema, callOptions{}, key)
+		executorPrompt(coords), userContent, "actions", executionSchema, executorOptions(), key)
 	if err != nil {
 		return nil, cost, err
 	}
@@ -415,8 +464,8 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 		res.InstructionDone = false
 	}
 
-	aiLogf("[%s] SUCCESS execution: verdict=%s done=%v reason=%q %d actions: %+v",
-		callID, res.Verdict, res.InstructionDone, res.Reason, len(res.Actions), res.Actions)
+	aiLogf("[%s] SUCCESS execution: saw=%q previousStepOK=%v verdict=%s done=%v reason=%q %d actions: %+v",
+		callID, res.Observation, res.PreviousStepOK, res.Verdict, res.InstructionDone, res.Reason, len(res.Actions), res.Actions)
 
 	return res, cost, nil
 }
@@ -425,11 +474,23 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 // carry out, plus the context needed to judge whether the screen is where
 // the plan expects (E3): the overall task, the whole plan with the current
 // step marked, the previous step, and the user's answers so far.
-func executorUserText(task Task, instruction string, idx int, w, h uint32) string {
+func executorUserText(task Task, instruction string, idx int, w, h uint32, clipboard string) string {
+	final := idx >= len(task.InstructionList)
 	var b strings.Builder
-	fmt.Fprintf(&b, "Instruction: %s\n\n", instruction)
-	fmt.Fprintf(&b, "Overall task: %s\n\n", task.Description)
-	b.WriteString("Plan:\n")
+	if final {
+		fmt.Fprintf(&b, "FINAL CHECK: %s\n\n", instruction)
+	} else {
+		fmt.Fprintf(&b, "CURRENT STEP (do ONLY this): %s\n\n", instruction)
+	}
+	if len(task.StepActions) > 0 {
+		b.WriteString("Already done for this step (the screenshot shows the result — do NOT repeat these; if the step is now complete, answer skip):\n")
+		for i, a := range task.StepActions {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, a)
+		}
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, "Overall task (context only): %s\n\n", task.Description)
+	b.WriteString("Plan (context only — never do other steps; they get their own turn):\n")
 	for i, step := range task.InstructionList {
 		marker := "   "
 		if i == idx {
@@ -437,11 +498,10 @@ func executorUserText(task Task, instruction string, idx int, w, h uint32) strin
 		}
 		fmt.Fprintf(&b, "%s%d. %s\n", marker, i+1, step)
 	}
-	if idx >= len(task.InstructionList) && len(task.InstructionList) > 0 {
-		b.WriteString("\nAll steps above have been carried out; this is the final check.\n")
-		fmt.Fprintf(&b, "Previous step: %s\n", task.InstructionList[len(task.InstructionList)-1])
+	if final && len(task.InstructionList) > 0 {
+		b.WriteString("\nAll steps above have been carried out; this is the final check. Answer skip if the task is done, otherwise replan or blocked with a reason. Do not act.\n")
 	} else if idx > 0 && idx-1 < len(task.InstructionList) {
-		fmt.Fprintf(&b, "\nPrevious step: %s\n", task.InstructionList[idx-1])
+		fmt.Fprintf(&b, "\nPrevious step (should already be done on screen): %s\n", task.InstructionList[idx-1])
 	} else {
 		b.WriteString("\nPrevious step: (none — this is the first step)\n")
 	}
@@ -451,10 +511,16 @@ func executorUserText(task Task, instruction string, idx int, w, h uint32) strin
 			fmt.Fprintf(&b, "- %s\n", a)
 		}
 	}
+	if clipboard != "" {
+		fmt.Fprintf(&b, "\nThe clipboard now contains: «%s»\n", clipboard)
+	}
 	if executionCoords() == coordsNorm1000 {
 		fmt.Fprintf(&b, "\nScreenshot size: %dx%d pixels. Give coordinates normalized to 0–1000, not pixels.", w, h)
 	} else {
 		fmt.Fprintf(&b, "\nScreenshot size: %dx%d pixels (0 <= x < %d, 0 <= y < %d).", w, h, w, h)
+	}
+	if !final {
+		fmt.Fprintf(&b, "\n\nReminder — the only step to carry out now: %s", instruction)
 	}
 	return b.String()
 }
@@ -509,6 +575,8 @@ func limitToOneClick(actions []Execution) ([]Execution, int) {
 // list of no-op clicks at (0,0).
 func parseExecResult(response string) (ExecResult, error) {
 	var raw struct {
+		Observation     string      `json:"observation"`
+		PreviousStepOK  *bool       `json:"previous_step_ok"`
 		Verdict         string      `json:"verdict"`
 		Reason          string      `json:"reason"`
 		InstructionDone *bool       `json:"instruction_done"`
@@ -520,9 +588,11 @@ func parseExecResult(response string) (ExecResult, error) {
 	}
 
 	res := ExecResult{
-		Verdict: strings.ToLower(strings.TrimSpace(raw.Verdict)),
-		Reason:  strings.TrimSpace(raw.Reason),
-		Actions: raw.Actions,
+		Observation:    strings.TrimSpace(raw.Observation),
+		PreviousStepOK: raw.PreviousStepOK == nil || *raw.PreviousStepOK,
+		Verdict:        strings.ToLower(strings.TrimSpace(raw.Verdict)),
+		Reason:         strings.TrimSpace(raw.Reason),
+		Actions:        raw.Actions,
 	}
 	if len(res.Actions) == 0 && len(raw.Response) > 0 {
 		res.Actions = raw.Response
@@ -643,6 +713,9 @@ func callOpenRouter(callID, mode, model, systemPrompt string, userContent []any,
 		}
 		if opts.maxTokens > 0 {
 			requestBody["max_tokens"] = opts.maxTokens
+		}
+		if opts.temperature != nil {
+			requestBody["temperature"] = *opts.temperature
 		}
 		if opts.reasoningEffort != "" {
 			requestBody["reasoning"] = map[string]any{"effort": opts.reasoningEffort}

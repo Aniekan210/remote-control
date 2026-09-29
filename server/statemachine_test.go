@@ -31,7 +31,22 @@ func plan(t Task, steps ...string) AIResult {
 }
 
 func exec(t Task, verdict string, done bool, reason string, actions ...Execution) AIResult {
-	return AIResult{Seq: t.Seq, Exec: ExecResult{Verdict: verdict, InstructionDone: done, Reason: reason, Actions: actions}}
+	return AIResult{Seq: t.Seq, Exec: ExecResult{PreviousStepOK: true, Verdict: verdict, InstructionDone: done, Reason: reason, Actions: actions}}
+}
+
+// execPrevFailed is an executor result that says the previous step didn't
+// take effect.
+func execPrevFailed(t Task, saw string) AIResult {
+	r := exec(t, verdictAct, true, "", click)
+	r.Exec.PreviousStepOK = false
+	r.Exec.Observation = saw
+	return r
+}
+
+// askPlan is the planner deciding to ask the user.
+func askPlan(t Task, question string) AIResult {
+	return AIResult{Seq: t.Seq, Planning: true, Image: "data:image/jpeg;base64,AAA",
+		Plan: PlanResult{Revise: true, Decision: decisionAsk, Message: question}}
 }
 
 var click = Execution{Type: "LEFT_CLICK"}
@@ -174,6 +189,11 @@ func TestStateMachine(t *testing.T) {
 			blocked := exec(task, verdictBlocked, false, "You're out of personalized invites.")
 			blocked.Image = "data:image/jpeg;base64,AAA"
 			task = onAIResult(task, blocked)
+			// The executor never asks directly: the planner double-checks.
+			mustEqual(t, "planner reviews first", task.Status, "RUNNING")
+			mustEqual(t, "context", task.Context, true)
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, askPlan(task, "You're out of personalized invites."))
 			mustEqual(t, "status", task.Status, "NEEDS_INPUT")
 			mustEqual(t, "question", task.Question, "You're out of personalized invites.")
 			mustEqual(t, "image", task.QuestionImage, "data:image/jpeg;base64,AAA")
@@ -187,7 +207,7 @@ func TestStateMachine(t *testing.T) {
 			mustEqual(t, "answers", len(task.Answers), 1)
 			mustEqual(t, "answer text", task.Answers[0], "Q: You're out of personalized invites. / A: send it without a note")
 			mustEqual(t, "question cleared", task.Question+task.QuestionKind+task.QuestionImage, "")
-			mustEqual(t, "not an auto replan", task.AutoReplans, 0)
+			mustEqual(t, "the answer isn't an auto replan", task.AutoReplans, 1)
 			mustEqual(t, "seq", task.Seq, seq+1)
 
 			task = onClientAction(task, advance(task.Seq))
@@ -201,6 +221,8 @@ func TestStateMachine(t *testing.T) {
 			task := running(t, "a")
 			task = onClientAction(task, advance(task.Seq))
 			task = onAIResult(task, exec(task, verdictBlocked, false, "Which account?"))
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, askPlan(task, "Which account?"))
 			task = onClientAction(task, answer("the other one"))
 			task = onClientAction(task, advance(task.Seq))
 			r := AIResult{Seq: task.Seq, Planning: true, Plan: PlanResult{Revise: true, Decision: decisionAsk, Message: "Work or personal?"}}
@@ -214,6 +236,8 @@ func TestStateMachine(t *testing.T) {
 			task := running(t, "a", "b")
 			task = onClientAction(task, advance(task.Seq))
 			task = onAIResult(task, exec(task, verdictBlocked, false, "Limit reached."))
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, askPlan(task, "Limit reached."))
 			task = onClientAction(task, answer("that's fine, skip the rest"))
 			task = onClientAction(task, advance(task.Seq))
 			r := AIResult{Seq: task.Seq, Planning: true, Plan: PlanResult{Revise: true, Decision: decisionStop, Message: "Skipping the rest."}}
@@ -275,7 +299,7 @@ func TestStateMachine(t *testing.T) {
 			mustEqual(t, "no call", task.InFlight, false)
 			mustEqual(t, "status", task.Status, "NEEDS_INPUT")
 			mustEqual(t, "kind", task.QuestionKind, "budget")
-			if !strings.HasPrefix(task.Question, "This task has used 50 AI calls / $0.050") {
+			if !strings.HasPrefix(task.Question, "This task has used 150 AI calls / $0.050") {
 				t.Fatalf("question = %q", task.Question)
 			}
 
@@ -387,6 +411,92 @@ func TestStateMachine(t *testing.T) {
 			task = onClientAction(task, advance(task.Seq))
 			task = onAIResult(task, AIResult{Seq: task.Seq, Err: errors.New("OpenRouter returned status 401: bad key")})
 			mustEqual(t, "error", task.LastError, "OpenRouter rejected the API key. Check it in Settings.")
+		}},
+
+		{"final check never improvises: act becomes a replan", func(t *testing.T) {
+			task := running(t, "a")
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "", click))
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "video isn't playing", click))
+			mustEqual(t, "no fix-up actions run", len(task.ExecutionList), 0)
+			mustEqual(t, "replan", task.Context, true)
+			mustEqual(t, "status", task.Status, "RUNNING")
+		}},
+
+		{"a second look at a step knows what was already done", func(t *testing.T) {
+			task := running(t, "open the File menu and choose Save")
+			task = onClientAction(task, advance(task.Seq))
+			move := Execution{Type: "MOUSE_MOVEMENT", MousePosX: 12, MousePosY: 30}
+			task = onAIResult(task, exec(task, verdictAct, false, "", move, click))
+			mustEqual(t, "history", strings.Join(task.StepActions, "|"), "clicked at (12, 30)")
+			if !strings.Contains(executorUserText(task, task.InstructionList[0], 0, 100, 100, ""), "Already done for this step") {
+				t.Fatal("executor isn't told what it already did")
+			}
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "", click))
+			mustEqual(t, "history cleared on the next step", len(task.StepActions), 0)
+		}},
+
+		{"two skips in a row hand back to the planner", func(t *testing.T) {
+			task := running(t, "go back", "open the first cat video", "play it")
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictSkip, true, "results visible"))
+			mustEqual(t, "first skip advances", task.CurrentInstructionIndex, 1)
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictSkip, true, "video open"))
+			mustEqual(t, "second skip doesn't advance", task.CurrentInstructionIndex, 1)
+			mustEqual(t, "replan instead", task.Context, true)
+
+			// Acting in between resets the streak.
+			task = running(t, "a", "b", "c", "d")
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictSkip, true, ""))
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "", click))
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictSkip, true, ""))
+			mustEqual(t, "skip after an act is fine", task.CurrentInstructionIndex, 3)
+		}},
+
+		{"a step that didn't take effect is redone, then replanned", func(t *testing.T) {
+			task := running(t, "focus the search box", "type cats", "submit")
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "", click)) // focus "done"
+			for i := 1; i <= maxBackSteps; i++ {
+				task = onClientAction(task, advance(task.Seq))
+				task = onAIResult(task, execPrevFailed(task, "the search box has no cursor"))
+				mustEqual(t, "back to the focus step", task.CurrentInstructionIndex, 0)
+				mustEqual(t, "nothing run", len(task.ExecutionList), 0)
+				task = onClientAction(task, advance(task.Seq))
+				task = onAIResult(task, exec(task, verdictAct, true, "", click)) // redo focus
+			}
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, execPrevFailed(task, "still no cursor"))
+			mustEqual(t, "replan after the redos", task.Context, true)
+			if !strings.Contains(strings.Join(task.History, "\n"), "didn't take effect") {
+				t.Fatalf("history = %v", task.History)
+			}
+		}},
+
+		{"progress refills the revise budget", func(t *testing.T) {
+			task := running(t, "a", "b", "c", "d", "e", "f")
+			for i := 0; i < limits.MaxAutoReplans; i++ {
+				task = onClientAction(task, advance(task.Seq))
+				task = onAIResult(task, exec(task, verdictReplan, false, "popup"))
+				task = onClientAction(task, advance(task.Seq))
+				task = onAIResult(task, plan(task, "a2", "b2", "c2", "d2", "e2", "f2"))
+			}
+			mustEqual(t, "budget used", task.AutoReplans, limits.MaxAutoReplans)
+			for i := 0; i < progressToRefill; i++ {
+				task = onClientAction(task, advance(task.Seq))
+				task = onAIResult(task, exec(task, verdictAct, true, "", click))
+			}
+			mustEqual(t, "refilled", task.AutoReplans, 0)
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictReplan, false, "another problem"))
+			mustEqual(t, "recovers on its own instead of asking", task.Status, "RUNNING")
+			mustEqual(t, "context", task.Context, true)
 		}},
 
 		{"refused CREATE_TASK", func(t *testing.T) {

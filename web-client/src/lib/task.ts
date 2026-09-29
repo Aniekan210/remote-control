@@ -37,6 +37,8 @@ export type Task = {
   confirmedIndex: number;
   /** parallel to instructionList: steps that need approval before they run */
   needsConfirm: boolean[];
+  /** what the AI last saw on screen / is doing (shown under the current step) */
+  note: string;
   /** OpenRouter spend on this task so far, in USD */
   costUsd: number;
   /** one-off error from the server (budget reached, missing key…); cleared on the next accepted action */
@@ -60,6 +62,7 @@ export const EMPTY_TASK: Task = {
   autoReplans: 0,
   confirmedIndex: -1,
   needsConfirm: [],
+  note: "",
   costUsd: 0,
   lastError: "",
 };
@@ -104,6 +107,7 @@ export function normalizeTask(raw: unknown): Task {
     autoReplans: Number(pick(o, "AutoReplans", "autoReplans", "auto_replans") ?? 0) || 0,
     confirmedIndex: Number(pick(o, "ConfirmedIndex", "confirmedIndex", "confirmed_index") ?? -1),
     needsConfirm: Array.isArray(needsConfirm) ? needsConfirm.map(Boolean) : [],
+    note: String(pick(o, "Note", "note") ?? ""),
     costUsd: Number(pick(o, "CostUSD", "costUsd", "cost_usd") ?? 0) || 0,
     lastError: String(pick(o, "LastError", "lastError", "last_error") ?? ""),
   };

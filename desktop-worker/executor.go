@@ -127,7 +127,7 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 		}
 		if cur.Seq != 0 && cur.Seq == lastSeq {
 			log.Printf("executor: seq=%d already handled — re-sending ADVANCE without replaying actions", cur.Seq)
-			sendAdvance(state, deviceID, cur.Context, fsQuery(cur), fsStore, "", cur.Seq)
+			sendAdvance(state, deviceID, cur.Context, fsQuery(cur), fsStore, "", cur.Seq, "")
 			continue
 		}
 		lastSeq = cur.Seq
@@ -140,13 +140,13 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 			execs, err := toScreenExecutions(cur.ExecutionList, state.Frame())
 			if err != nil {
 				log.Printf("executor: refusing execution list: %v", err)
-				sendAdvance(state, deviceID, false, "", fsStore, err.Error(), cur.Seq)
+				sendAdvance(state, deviceID, false, "", fsStore, err.Error(), cur.Seq, "")
 				continue
 			}
 			if !executeList(execs, overlay, overlayStateFor(cur), cur.Seq) {
 				continue // cancelled with the hotkey mid-batch
 			}
-			sendAdvance(state, deviceID, false, "", fsStore, "", cur.Seq)
+			sendAdvance(state, deviceID, false, "", fsStore, "", cur.Seq, clipboardAfterCopy(cur, execs))
 			continue
 		}
 
@@ -159,8 +159,49 @@ func RunExecutor(state *State, deviceID string, changes <-chan TaskChange, overl
 
 		// Our turn to ask for the next step. The filesystem snapshot is
 		// attached whenever Context is true (a plan or a revise is next).
-		sendAdvance(state, deviceID, cur.Context, fsQuery(cur), fsStore, "", cur.Seq)
+		sendAdvance(state, deviceID, cur.Context, fsQuery(cur), fsStore, "", cur.Seq, "")
 	}
+}
+
+// clipboardAfterCopy reports what the clipboard holds after a batch that
+// copied something (Ctrl+C / Ctrl+X, or a step about copying — e.g. a
+// right-click "Copy"), so the executor can check the copy really worked:
+// the clipboard isn't visible on screen. Only then — the clipboard isn't
+// sent anywhere otherwise. Truncated; "" when nothing was copied.
+func clipboardAfterCopy(t Task, execs []Execution) string {
+	copied := false
+	for _, e := range execs {
+		k := strings.ToUpper(e.KeyString)
+		if e.Type == "KEYBOARD_INPUT" && (strings.Contains(k, "{CTRL+C}") || strings.Contains(k, "{CTRL+X}") ||
+			strings.Contains(k, "{CTRL+INSERT}")) {
+			copied = true
+		}
+	}
+	for _, i := range []int{t.CurrentInstructionIndex - 1, t.CurrentInstructionIndex} {
+		if i >= 0 && i < len(t.InstructionList) {
+			step := strings.ToLower(t.InstructionList[i])
+			if strings.Contains(step, "copy") || strings.Contains(step, "cut ") {
+				copied = true
+			}
+		}
+	}
+	if !copied {
+		return ""
+	}
+	time.Sleep(150 * time.Millisecond) // let the app finish writing it
+	text, ok, err := readClipboardText()
+	switch {
+	case err != nil:
+		return "(couldn't read the clipboard)"
+	case !ok || strings.TrimSpace(text) == "":
+		return "(empty, or not text)"
+	}
+	const maxLen = 300
+	if r := []rune(text); len(r) > maxLen {
+		text = string(r[:maxLen]) + "…"
+	}
+	log.Printf("executor: after a copy the clipboard holds %d characters", len([]rune(text)))
+	return text
 }
 
 // fsQuery is the text the filesystem snapshot is filtered against: the
@@ -197,7 +238,7 @@ func toScreenExecutions(execs []Execution, frame shotFrame) ([]Execution, error)
 // task text) to pick which entries are relevant. workerErr, if set, tells
 // the server the last step couldn't be carried out here. seq is the
 // Task.Seq this ADVANCE answers; the server ignores it once it has moved on.
-func sendAdvance(state *State, deviceID string, includeFS bool, query string, fsStore *SnapshotStore, workerErr string, seq int) {
+func sendAdvance(state *State, deviceID string, includeFS bool, query string, fsStore *SnapshotStore, workerErr string, seq int, clipboard string) {
 	// Don't capture or advance while the human is driving the mouse.
 	takeover.Gate()
 
@@ -235,6 +276,7 @@ func sendAdvance(state *State, deviceID string, includeFS bool, query string, fs
 		ScreenshotPayload: shot,
 		Error:             workerErr,
 		Seq:               seq,
+		Clipboard:         clipboard,
 	}
 	if includeFS {
 		snap := fsStore.Snapshot(query)

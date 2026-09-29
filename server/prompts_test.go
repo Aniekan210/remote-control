@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+func TestExecutionCoordsFollowsTheModel(t *testing.T) {
+	t.Setenv("EXECUTION_COORDS", "")
+	t.Setenv("EXECUTION_MODEL", "")
+	if executionCoords() != coordsNorm1000 {
+		t.Error("the default executor (Qwen3-VL) answers in 0–1000")
+	}
+	t.Setenv("EXECUTION_MODEL", "qwen/qwen2.5-vl-72b-instruct")
+	if executionCoords() != coordsPixels {
+		t.Error("Qwen2.5-VL answers in pixels")
+	}
+	t.Setenv("EXECUTION_COORDS", coordsNorm1000)
+	if executionCoords() != coordsNorm1000 {
+		t.Error("EXECUTION_COORDS overrides")
+	}
+}
+
 func TestExecutorPromptCoordinateModes(t *testing.T) {
 	pixels := executorPrompt(coordsPixels)
 	norm := executorPrompt(coordsNorm1000)
@@ -50,6 +66,21 @@ func TestLimitToOneClick(t *testing.T) {
 		kept, cut := limitToOneClick(c.in)
 		if len(kept) != c.wantKept || cut != len(c.in)-c.wantKept {
 			t.Errorf("%s: kept %d cut %d, want kept %d", c.name, len(kept), cut, c.wantKept)
+		}
+	}
+}
+
+func TestMentionsFiles(t *testing.T) {
+	yes := []string{"open the file", "Save it to my Downloads folder", "the report.pdf", `C:\Users\me`, "User answered: attach the screenshot"}
+	no := []string{"The search results do not show Blossom's LinkedIn profile.", "a popup is in the way", "User answered: send it without a note"}
+	for _, s := range yes {
+		if !mentionsFiles(s) {
+			t.Errorf("should mention files: %q", s)
+		}
+	}
+	for _, s := range no {
+		if mentionsFiles(s) {
+			t.Errorf("should not mention files: %q", s)
 		}
 	}
 }

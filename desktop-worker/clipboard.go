@@ -12,10 +12,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// Clipboard access for pasting long or non-ASCII text (see TypeText):
-// typing character by character is slow and some apps drop or reorder
-// fast Unicode packets, while a single Ctrl+V is atomic. The user's own
-// clipboard is saved first and put back afterwards.
+// Clipboard access: reading what a copy put there (so the executor can
+// check the copy worked — see clipboardAfterCopy in executor.go), and, with
+// TYPE_WITH_PASTE=1, pasting long text instead of typing it (the user's
+// clipboard is saved first and put back afterwards).
 
 const (
 	cfUnicodeText = 13
@@ -123,8 +123,9 @@ func pasteText(text string) error {
 	handleKeyToken("CTRL+V")
 
 	// The target app reads the clipboard while handling the paste; give it
-	// a moment before swapping the old contents back in.
-	time.Sleep(150 * time.Millisecond)
+	// time (a busy browser can take a while) before swapping the old
+	// contents back in, or it pastes those instead.
+	time.Sleep(600 * time.Millisecond)
 	if hadText {
 		_ = writeClipboardText(prev)
 	}

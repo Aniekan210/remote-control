@@ -32,6 +32,8 @@ export type StepRecord = {
   /** when this step's actions arrived from the AI */
   actionsAt: number | null;
   actions: Execution[];
+  /** what the AI saw on screen while working on this step */
+  note?: string;
 };
 
 export type Mark = {
@@ -171,6 +173,14 @@ export function reduceTimeline(store: TimelineStore, snap: Task, now: number, in
     activeIndex = at;
   }
   if (steps.length === 0) activeIndex = undefined;
+
+  // ── What the AI saw ───────────────────────────────────────────
+  // The note comes with the batch it explains, which belongs to the step
+  // that just got its actions (or the one in play).
+  if (snap.note && steps.length > 0) {
+    const at = Math.min(Math.max(activeIndex ?? activeStepIndex({ steps }), 0), steps.length - 1);
+    if (steps[at].note !== snap.note) steps[at].note = snap.note;
+  }
 
   // ── Pause / resume ────────────────────────────────────────────
   const active = activeStepIndex({ ...cur, steps, activeIndex });

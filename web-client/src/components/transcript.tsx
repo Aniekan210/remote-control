@@ -282,6 +282,12 @@ function StepRow({
     >
       {expanded && canExpand && (
         <div className="ml-8">
+          {step.note && (
+            <p className="mb-2 text-[13px] leading-snug text-dim italic">
+              <span className="not-italic text-faint">Saw: </span>
+              {step.note}
+            </p>
+          )}
           {n === 0 ? (
             <p className="font-mono text-[12px]">
               {state === "current" ? (
