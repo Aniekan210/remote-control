@@ -429,6 +429,36 @@ function QuestionMarkRow({ m }: { m: Mark }) {
   );
 }
 
+/** How the computer was left: a thumbnail, tap for full screen. */
+function FinalScreen({ src }: { src: string }) {
+  const [zoomed, setZoomed] = useState(false);
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setZoomed(true)}
+        aria-label="View the final screen full size"
+        className="mt-3 block w-full overflow-hidden rounded-xl border border-line active:opacity-80"
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={src} alt="The computer's screen when the task finished" className="w-full" />
+      </button>
+      <span className="mt-1.5 block font-mono text-[10px] text-faint">Final screen · tap to enlarge</span>
+      {zoomed && (
+        <span
+          role="dialog"
+          aria-label="Final screen"
+          onClick={() => setZoomed(false)}
+          className="fixed inset-0 z-50 grid place-items-center bg-black/90 p-2"
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={src} alt="The computer's screen when the task finished" className="max-h-full max-w-full object-contain" />
+        </span>
+      )}
+    </>
+  );
+}
+
 function OutcomeRow({ t }: { t: Timeline }) {
   const elapsed = (t.endedAt ?? t.startedAt) - t.startedAt;
   const actions = totalActions(t);
@@ -447,6 +477,7 @@ function OutcomeRow({ t }: { t: Timeline }) {
             <span className="mt-1 block font-mono text-[11px] text-faint">
               {t.steps.length} steps · {actions} actions · {fmtDuration(elapsed)}
             </span>
+            {t.finalImage && <FinalScreen src={t.finalImage} />}
           </span>
         }
       />

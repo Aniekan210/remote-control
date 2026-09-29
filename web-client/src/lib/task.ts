@@ -39,6 +39,8 @@ export type Task = {
   needsConfirm: boolean[];
   /** what the AI last saw on screen / is doing (shown under the current step) */
   note: string;
+  /** data: URL of the screen when the task completed */
+  finalImage: string;
   /** OpenRouter spend on this task so far, in USD */
   costUsd: number;
   /** one-off error from the server (budget reached, missing key…); cleared on the next accepted action */
@@ -63,6 +65,7 @@ export const EMPTY_TASK: Task = {
   confirmedIndex: -1,
   needsConfirm: [],
   note: "",
+  finalImage: "",
   costUsd: 0,
   lastError: "",
 };
@@ -108,6 +111,7 @@ export function normalizeTask(raw: unknown): Task {
     confirmedIndex: Number(pick(o, "ConfirmedIndex", "confirmedIndex", "confirmed_index") ?? -1),
     needsConfirm: Array.isArray(needsConfirm) ? needsConfirm.map(Boolean) : [],
     note: String(pick(o, "Note", "note") ?? ""),
+    finalImage: String(pick(o, "FinalImage", "finalImage", "final_image") ?? ""),
     costUsd: Number(pick(o, "CostUSD", "costUsd", "cost_usd") ?? 0) || 0,
     lastError: String(pick(o, "LastError", "lastError", "last_error") ?? ""),
   };

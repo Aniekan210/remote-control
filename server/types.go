@@ -31,6 +31,7 @@ type Task struct {
 	ConfirmedIndex          int         `json:"confirmed_index"`  // index of the last step the user approved; -1 = none
 	NeedsConfirm            []bool      `json:"needs_confirm"`    // parallel to InstructionList: steps that must be approved first
 	Note                    string      `json:"note"`             // what the executor last saw / is doing, shown in the app
+	FinalImage              string      `json:"final_image"`      // data URL of the screen when the task completed
 	CostUSD                 float64     `json:"cost_usd"`         // total OpenRouter spend on this task so far
 	LastError               string      `json:"last_error"`       // one-off error for the client (budget reached, ...); cleared on the next accepted action
 
@@ -45,6 +46,7 @@ type Task struct {
 	StepActions   []string `json:"-"` // what earlier batches already did for the current instruction (shown to the executor)
 	SkipStreak    int      `json:"-"` // steps skipped in a row with nothing done in between
 	History       []string `json:"-"` // what actually happened, step by step — the revise planner reads it
+	UserNotes     string   `json:"-"` // the user's standing instructions (Settings), sent with every AI call
 	Once          []bool   `json:"-"` // parallel to InstructionList: do-once steps (photo, send, submit, pay, delete, …) are never redone automatically
 	Progress      int      `json:"-"` // steps completed since the last automatic revise
 	BackSteps     int      `json:"-"` // times a step was sent back because the one before it hadn't worked
@@ -75,6 +77,7 @@ type Action struct {
 	// machine stays pure: see onClientAction.
 	ReceivedAt time.Time `json:"-"` // when the action arrived
 	Refused    string    `json:"-"` // CREATE_TASK only: why the task can't start (shown as last_error)
+	UserNotes  string    `json:"-"` // CREATE_TASK only: the user's standing instructions from Settings
 }
 
 type FileEntry struct {

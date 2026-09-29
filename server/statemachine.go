@@ -77,6 +77,7 @@ func onClientAction(t Task, a Action) Task {
 		next.Status = "RUNNING"
 		next.Context = true
 		next.StartedAt = a.ReceivedAt
+		next.UserNotes = a.UserNotes
 		next.Seq = t.Seq + 1
 		srvLogf("device=%s: CREATE_TASK description=%q (full state reset)", t.DeviceID, a.Description)
 		return next
@@ -232,6 +233,15 @@ func onAdvance(t Task, a Action) Task {
 // one that arrives while the task is paused — the screen may have changed
 // under it — in which case the worker re-sends its ADVANCE on resume.
 func onAIResult(t Task, r AIResult) Task {
+	t = onAIResultInner(t, r)
+	if t.Status == "COMPLETED" && t.FinalImage == "" {
+		// Show the user how the computer was left.
+		t.FinalImage = r.Image
+	}
+	return t
+}
+
+func onAIResultInner(t Task, r AIResult) Task {
 	if r.Seq != t.Seq {
 		srvLogf("device=%s: dropping stale AI result for seq %d, task is now at seq %d (%s)",
 			t.DeviceID, r.Seq, t.Seq, t.Status)

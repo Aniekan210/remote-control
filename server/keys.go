@@ -202,3 +202,32 @@ func decryptAPIKey(enc string) (string, error) {
 	}
 	return string(plain), nil
 }
+
+// maxUserNotes bounds the standing instructions (the web app enforces the
+// same limit): they ride along on every AI call.
+const maxUserNotes = 4000
+
+// loadUserNotes fetches the standing instructions the device's user saved
+// in Settings (the user_instructions table, created by the web app). Any
+// failure just means no instructions — a task never fails over them.
+func loadUserNotes(ctx context.Context, deviceID string) string {
+	if db == nil || dbErr != nil {
+		return ""
+	}
+	var notes string
+	err := db.QueryRow(ctx,
+		`SELECT i.instructions
+		   FROM device d
+		   JOIN user_instructions i ON i.user_id = d.user_id
+		  WHERE d.device_id = $1`, deviceID).Scan(&notes)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) && !isUndefinedTable(err) {
+			srvLogf("device=%s: couldn't load the user's instructions: %v", deviceID, err)
+		}
+		return ""
+	}
+	if r := []rune(notes); len(r) > maxUserNotes {
+		notes = string(r[:maxUserNotes])
+	}
+	return strings.TrimSpace(notes)
+}

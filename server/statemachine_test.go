@@ -535,6 +535,37 @@ func TestStateMachine(t *testing.T) {
 			mustEqual(t, "still on the step", task.CurrentInstructionIndex, 0)
 		}},
 
+		{"the final screen is kept when the task completes", func(t *testing.T) {
+			task := running(t, "a")
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "", click))
+			task = onClientAction(task, advance(task.Seq))
+			final := exec(task, verdictSkip, true, "done")
+			final.Image = "data:image/jpeg;base64,FINAL"
+			task = onAIResult(task, final)
+			mustEqual(t, "status", task.Status, "COMPLETED")
+			mustEqual(t, "final image", task.FinalImage, "data:image/jpeg;base64,FINAL")
+			task = onClientAction(task, create("next"))
+			mustEqual(t, "cleared for the next task", task.FinalImage, "")
+		}},
+
+		{"standing instructions reach every AI call", func(t *testing.T) {
+			a := create("open notepad")
+			a.UserNotes = "My taskbar is hidden; use the Windows key."
+			task := onClientAction(resetTask("dev"), a)
+			mustEqual(t, "kept on the task", task.UserNotes, "My taskbar is hidden; use the Windows key.")
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, plan(task, "open notepad"))
+			if !strings.Contains(executorUserText(task, "open notepad", 0, 100, 100, ""), "My taskbar is hidden") {
+				t.Fatal("executor message is missing the instructions")
+			}
+			for _, revise := range []bool{false, true} {
+				if !strings.Contains(plannerUserText(task, advance(task.Seq), revise, t0), "My taskbar is hidden") {
+					t.Fatalf("planner message (revise=%v) is missing the instructions", revise)
+				}
+			}
+		}},
+
 		{"refused CREATE_TASK", func(t *testing.T) {
 			a := create("x")
 			a.Refused = "Add your OpenRouter key in Settings"

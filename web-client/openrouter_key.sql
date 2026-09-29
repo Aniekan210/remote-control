@@ -6,3 +6,11 @@ CREATE TABLE IF NOT EXISTS openrouter_key (
   key_last4  TEXT NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Standing instructions for the AI (Settings → Instructions for the AI).
+-- Also created automatically by the web app on first use.
+CREATE TABLE IF NOT EXISTS user_instructions (
+  user_id      TEXT PRIMARY KEY,
+  instructions TEXT NOT NULL,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);

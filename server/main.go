@@ -205,6 +205,14 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 		var newKey apiKey
 		if action.Type == "CREATE_TASK" {
 			newKey, action.Refused = checkCanStart(r.Context(), taskID)
+			if action.Refused == "" {
+				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				action.UserNotes = loadUserNotes(ctx, taskID)
+				cancel()
+				if action.UserNotes != "" {
+					srvLogf("device=%s: using the user's standing instructions (%d chars)", taskID, len(action.UserNotes))
+				}
+			}
 		}
 
 		mutex.Lock()

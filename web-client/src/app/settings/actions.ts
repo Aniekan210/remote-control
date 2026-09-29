@@ -5,6 +5,7 @@ import { requireSession } from "@/lib/session";
 import { DeviceTakenError, removeDevice, upsertDevice } from "@/lib/device";
 import { DEVICE_ID_PATTERN } from "@/lib/device-id";
 import { checkKey, removeKey, saveKey } from "@/lib/openrouter-key";
+import { MAX_INSTRUCTIONS, saveInstructions } from "@/lib/instructions";
 
 export type LinkState = { ok: boolean; error?: string } | null;
 
@@ -64,6 +65,24 @@ export async function removeOpenRouterKey(): Promise<void> {
   const session = await requireSession();
   await removeKey(session.user.id);
   revalidatePath("/settings");
+}
+
+export type InstructionsState = { ok: boolean; error?: string; savedAt?: number } | null;
+
+export async function saveAIInstructions(_prev: InstructionsState, form: FormData): Promise<InstructionsState> {
+  const session = await requireSession();
+  const text = String(form.get("instructions") ?? "");
+  if (text.trim().length > MAX_INSTRUCTIONS) {
+    return { ok: false, error: `Keep it under ${MAX_INSTRUCTIONS} characters.` };
+  }
+  try {
+    await saveInstructions(session.user.id, text);
+  } catch (err) {
+    console.error("saveAIInstructions", err);
+    return { ok: false, error: "Couldn't save. Try again." };
+  }
+  revalidatePath("/settings");
+  return { ok: true, savedAt: Date.now() };
 }
 
 export async function unlinkDevice(): Promise<void> {

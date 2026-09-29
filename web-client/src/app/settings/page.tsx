@@ -4,7 +4,8 @@ import { getDevice } from "@/lib/device";
 import { extractDeviceId } from "@/lib/device-id";
 import { IconBack } from "@/components/icons";
 import { getKeyInfo } from "@/lib/openrouter-key";
-import { ApiKeyCard, DeviceCard, DeviceForm, SignOutButton } from "./client";
+import { getInstructions, MAX_INSTRUCTIONS } from "@/lib/instructions";
+import { ApiKeyCard, DeviceCard, DeviceForm, InstructionsCard, SignOutButton } from "./client";
 
 export const dynamic = "force-dynamic";
 
@@ -21,6 +22,10 @@ export default async function SettingsPage({
   const apiKey = await getKeyInfo(session.user.id).catch((err) => {
     console.error("getKeyInfo", err);
     return null;
+  });
+  const instructions = await getInstructions(session.user.id).catch((err) => {
+    console.error("getInstructions", err);
+    return "";
   });
   const { user } = session;
 
@@ -56,6 +61,13 @@ export default async function SettingsPage({
           ) : (
             <DeviceForm initialDeviceId={incoming ?? ""} />
           )}
+        </Section>
+
+        <Section
+          title="Instructions for the AI"
+          hint="Sent with every step of every task. Describe how your computer is set up and anything it should always or never do."
+        >
+          <InstructionsCard initial={instructions} max={MAX_INSTRUCTIONS} />
         </Section>
 
         <Section
