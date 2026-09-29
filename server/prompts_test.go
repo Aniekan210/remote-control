@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+func TestExecutionCoordsFollowsTheModel(t *testing.T) {
+	t.Setenv("EXECUTION_COORDS", "")
+	t.Setenv("EXECUTION_MODEL", "")
+	if executionCoords() != coordsNorm1000 {
+		t.Error("the default executor (Qwen3-VL) answers in 0–1000")
+	}
+	t.Setenv("EXECUTION_MODEL", "qwen/qwen2.5-vl-72b-instruct")
+	if executionCoords() != coordsPixels {
+		t.Error("Qwen2.5-VL answers in pixels")
+	}
+	t.Setenv("EXECUTION_COORDS", coordsNorm1000)
+	if executionCoords() != coordsNorm1000 {
+		t.Error("EXECUTION_COORDS overrides")
+	}
+}
+
 func TestExecutorPromptCoordinateModes(t *testing.T) {
 	pixels := executorPrompt(coordsPixels)
 	norm := executorPrompt(coordsNorm1000)

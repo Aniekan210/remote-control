@@ -32,11 +32,13 @@ const (
 	// structured reasoner with strong vision. Overridable via PLANNING_MODEL.
 	defaultPlanningModel = "google/gemini-3.1-pro-preview"
 
-	// EXECUTION is a visual-grounding job (turn one instruction + the
-	// screenshot into exact click pixels). Qwen2.5-VL is grounding-first —
-	// coordinate/point output is a trained capability, not an afterthought
-	// — which is exactly what pixel-accurate clicking needs.
-	defaultExecutionModel = "qwen/qwen2.5-vl-72b-instruct"
+	// EXECUTION is the step-by-step job: judge whether the screen is where
+	// the plan expects, then turn one instruction + the screenshot into
+	// exact clicks and keystrokes. Qwen3-VL is built for GUI agent work —
+	// much better at that judgement than Qwen2.5-VL, and cheaper on
+	// OpenRouter. It grounds in 0–1000 normalized coordinates, which
+	// executionCoords picks automatically. Overridable via EXECUTION_MODEL.
+	defaultExecutionModel = "qwen/qwen3-vl-235b-a22b-instruct"
 )
 
 // Planner output limits (B5). Reasoning tokens are billed as output tokens
@@ -98,8 +100,17 @@ const (
 	coordsNorm1000 = "norm1000"
 )
 
+// executionCoords is EXECUTION_COORDS if set, else what the executor model
+// is known to use: Qwen3-VL answers in 0–1000 normalized coordinates,
+// Qwen2.5-VL (and most others) in pixels.
 func executionCoords() string {
-	if os.Getenv("EXECUTION_COORDS") == coordsNorm1000 {
+	switch os.Getenv("EXECUTION_COORDS") {
+	case coordsNorm1000:
+		return coordsNorm1000
+	case coordsPixels:
+		return coordsPixels
+	}
+	if strings.Contains(strings.ToLower(modelForContext(false)), "qwen3-vl") {
 		return coordsNorm1000
 	}
 	return coordsPixels
