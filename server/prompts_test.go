@@ -84,3 +84,13 @@ func TestMentionsFiles(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadingWaitIsAnAction(t *testing.T) {
+	res, err := parseExecResult(`{"observation":"spinner","previous_step_ok":true,"verdict":"act","reason":"","instruction_done":false,"actions":[]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.InstructionDone || len(res.Actions) != 1 || res.Actions[0].Type != "WAIT" {
+		t.Fatalf("got %+v", res)
+	}
+}
