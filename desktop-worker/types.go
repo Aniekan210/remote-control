@@ -29,6 +29,7 @@ type Task struct {
 	AutoReplans    int      `json:"auto_replans"`
 	ConfirmedIndex int      `json:"confirmed_index"`
 	NeedsConfirm   []bool   `json:"needs_confirm"`
+	Note           string   `json:"note"`
 	CostUSD        float64  `json:"cost_usd"`
 	LastError      string   `json:"last_error"`
 }
@@ -55,6 +56,9 @@ type Action struct {
 	// Seq, on ADVANCE, is the Task.Seq this ADVANCE answers. The server
 	// ignores ADVANCEs for a state it has already moved past.
 	Seq int `json:"seq,omitempty"`
+	// Clipboard, on ADVANCE after a copy, is what the clipboard now holds
+	// (truncated), so the executor can check the copy worked.
+	Clipboard string `json:"clipboard,omitempty"`
 }
 
 type FileEntry struct {

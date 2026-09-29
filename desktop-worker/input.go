@@ -4,9 +4,11 @@ package main
 
 import (
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -231,14 +233,9 @@ func RightClick() {
 // TypeText turns one KEYBOARD_INPUT's key_string into keystrokes. It has
 // two modes, mixed freely within a single string:
 //
-//   - Literal text. Short plain-ASCII runs are typed as Unicode packets
-//     (KEYEVENTF_UNICODE), which sidesteps virtual-key/layout mapping.
-//     Runs longer than pasteThreshold characters, or with any non-ASCII
-//     character, are pasted instead (clipboard + Ctrl+V, then the user's
-//     clipboard is put back): one atomic paste is faster, and apps can drop
-//     or reorder long bursts of Unicode packets, or mangle characters
-//     outside the Basic Multilingual Plane (emoji), which packets can't
-//     send at all. If the clipboard can't be used, the run is typed.
+//   - Literal text is typed as Unicode key presses (KEYEVENTF_UNICODE),
+//     batched into chunks (see typeUnicode), which sidesteps
+//     virtual-key/layout mapping and handles any character.
 //   - {TOKEN} sequences press real keys and chords: {WIN}, {ENTER}, {TAB},
 //     {ESC}, {WIN+D} (show desktop), {ALT+F4} (close window),
 //     {CTRL+SHIFT+ESC}, arrows, F-keys, etc. See handleKeyToken.
@@ -291,27 +288,54 @@ func TypeText(s string) {
 	flush()
 }
 
-// pasteThreshold: literal runs longer than this (in characters) are pasted.
+// pasteThreshold: with TYPE_WITH_PASTE=1, literal runs longer than this
+// (in characters), or with non-ASCII characters, are pasted instead.
 const pasteThreshold = 20
 
-// typeLiteral enters one run of literal text: pasted when it's long or
-// not plain ASCII, typed otherwise (see TypeText).
+// typeWithPaste (TYPE_WITH_PASTE=1) brings back pasting long text through
+// the clipboard. Off by default: a paste races the target app (if it
+// reads the clipboard after the old contents are put back, it pastes the
+// wrong text), and it disturbs the clipboard that copy-and-paste tasks
+// rely on. Batched Unicode input below is as reliable without either.
+var typeWithPaste = os.Getenv("TYPE_WITH_PASTE") == "1"
+
+// typeLiteral enters one run of literal text (see TypeText).
 func typeLiteral(run []rune) {
-	if len(run) > pasteThreshold || !isASCII(run) {
+	if typeWithPaste && (len(run) > pasteThreshold || !isASCII(run)) {
 		if err := pasteText(string(run)); err == nil {
 			return
 		} else {
 			log.Printf("input: clipboard paste failed (%v) — typing the text instead", err)
 		}
 	}
-	for _, r := range run {
-		if r <= 0xFFFF {
-			code := uint16(r)
-			sendKeybdEvent(code, keyEventFUnicode)
-			sendKeybdEvent(code, keyEventFUnicode|keyEventFKeyUp)
-			time.Sleep(8 * time.Millisecond)
+	typeUnicode(run)
+}
+
+// typeChunk is how many UTF-16 units go into one SendInput call.
+const typeChunk = 16
+
+// typeUnicode types text as KEYEVENTF_UNICODE key presses, a chunk of
+// characters per SendInput call. One call inserts its whole chunk into the
+// input stream atomically, so fast typing can't be reordered or
+// interleaved with other input, and the short pause between chunks lets
+// slow apps (web pages with autocomplete) keep up. Any character works,
+// including emoji and other text outside the Basic Multilingual Plane
+// (sent as a surrogate pair), and the clipboard is never touched.
+func typeUnicode(run []rune) {
+	units := utf16.Encode(run)
+	for i := 0; i < len(units); i += typeChunk {
+		end := min(i+typeChunk, len(units))
+		evs := make([]keybdInputEvent, 0, 2*(end-i))
+		for _, u := range units[i:end] {
+			evs = append(evs,
+				keybdInputEvent{inputType: inputTypeKeyboard, ki: keybdInput{wScan: u, dwFlags: keyEventFUnicode}},
+				keybdInputEvent{inputType: inputTypeKeyboard, ki: keybdInput{wScan: u, dwFlags: keyEventFUnicode | keyEventFKeyUp}},
+			)
 		}
+		procSendInput.Call(uintptr(len(evs)), uintptr(unsafe.Pointer(&evs[0])), unsafe.Sizeof(evs[0]))
+		time.Sleep(25 * time.Millisecond)
 	}
+	time.Sleep(40 * time.Millisecond)
 }
 
 func isASCII(rs []rune) bool {

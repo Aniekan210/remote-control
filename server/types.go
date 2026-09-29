@@ -30,6 +30,7 @@ type Task struct {
 	AutoReplans             int         `json:"auto_replans"`     // automatic revises so far (capped)
 	ConfirmedIndex          int         `json:"confirmed_index"`  // index of the last step the user approved; -1 = none
 	NeedsConfirm            []bool      `json:"needs_confirm"`    // parallel to InstructionList: steps that must be approved first
+	Note                    string      `json:"note"`             // what the executor last saw / is doing, shown in the app
 	CostUSD                 float64     `json:"cost_usd"`         // total OpenRouter spend on this task so far
 	LastError               string      `json:"last_error"`       // one-off error for the client (budget reached, ...); cleared on the next accepted action
 
@@ -43,6 +44,10 @@ type Task struct {
 	InstrAttempts int      `json:"-"` // executor calls on the current instruction (capped, then replan)
 	StepActions   []string `json:"-"` // what earlier batches already did for the current instruction (shown to the executor)
 	SkipStreak    int      `json:"-"` // steps skipped in a row with nothing done in between
+	History       []string `json:"-"` // what actually happened, step by step — the revise planner reads it
+	Progress      int      `json:"-"` // steps completed since the last automatic revise
+	BackSteps     int      `json:"-"` // times a step was sent back because the one before it hadn't worked
+	BackAt        int      `json:"-"` // the step index that last sent us back (the guard resets once past it)
 	InFlight      bool     `json:"-"` // an AI call for the current Seq is running; further ADVANCEs for it are duplicates
 }
 
@@ -61,8 +66,9 @@ type Action struct {
 	Description       string      `json:"description"`         // for CREATE_TASK
 	FileSystemPayload []FileEntry `json:"file_system_payload"` // for ADVANCE
 	ScreenshotPayload Screenshot  `json:"screenshot_payload"`
-	Error             string      `json:"error"` // for ADVANCE: the worker couldn't carry out the last step (screenshot failed, bad coordinates, unknown action)
-	Seq               int         `json:"seq"`   // for ADVANCE: the Task.Seq the worker acted on; stale ones are ignored
+	Error             string      `json:"error"`     // for ADVANCE: the worker couldn't carry out the last step (screenshot failed, bad coordinates, unknown action)
+	Seq               int         `json:"seq"`       // for ADVANCE: the Task.Seq the worker acted on; stale ones are ignored
+	Clipboard         string      `json:"clipboard"` // for ADVANCE after a copy: what the clipboard holds now (truncated), so the copy can be checked
 
 	// Set by the server, never by a client (json:"-"), so the state
 	// machine stays pure: see onClientAction.

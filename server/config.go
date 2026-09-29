@@ -22,12 +22,14 @@ var limits = defaultLimits()
 
 func defaultLimits() Limits {
 	return Limits{
-		// Granular plans mean many cheap executor calls, so the call cap is
-		// generous; the planner cap is what actually bounds cost.
-		MaxAICallsPerTask:      50,
-		MaxPlannerCallsPerTask: 4,
-		MaxTaskCostUSD:         0.10,
-		MaxTaskDuration:        10 * time.Minute,
+		// Sized for long multi-step tasks (dozens of granular steps, a few
+		// recoveries): granular plans mean many cheap executor calls, and
+		// a revise is a planner call. Hitting one asks "continue?", so
+		// tighter caps just mean more interruptions.
+		MaxAICallsPerTask:      150,
+		MaxPlannerCallsPerTask: 12,
+		MaxTaskCostUSD:         0.50,
+		MaxTaskDuration:        30 * time.Minute,
 		MonthlyBudgetUSD:       6,
 		MaxAutoReplans:         3,
 	}

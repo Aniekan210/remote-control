@@ -61,9 +61,19 @@ type callOptions struct {
 	temperature     *float64
 }
 
-// plannerOptions returns the planner's output limits.
-func plannerOptions() callOptions {
+// plannerOptions returns the planner's output limits. A revise — the
+// plan has already gone wrong once — gets more thinking (medium effort,
+// REVISE_REASONING_EFFORT) and room for it: recovering well mid-task is
+// where accuracy is won or lost, and it's a handful of calls per task.
+func plannerOptions(revise bool) callOptions {
 	opts := callOptions{maxTokens: defaultPlannerMaxTokens, reasoningEffort: defaultPlannerReasoningEffort}
+	if revise {
+		opts.maxTokens = 2 * defaultPlannerMaxTokens
+		opts.reasoningEffort = "medium"
+		if v := os.Getenv("REVISE_REASONING_EFFORT"); v != "" {
+			opts.reasoningEffort = v
+		}
+	}
 	if v := os.Getenv("PLANNER_MAX_TOKENS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			opts.maxTokens = n
@@ -220,6 +230,11 @@ var executionActionSchema = map[string]any{
 var executionSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
+		// observation and previous_step_ok come FIRST on purpose: the model
+		// writes fields in schema order, so it describes the screen and
+		// checks the last step before it commits to a verdict or a click.
+		"observation":      map[string]any{"type": "string"},
+		"previous_step_ok": map[string]any{"type": "boolean"},
 		"verdict": map[string]any{
 			"type": "string",
 			"enum": []string{"act", "skip", "replan", "blocked"},
@@ -231,7 +246,7 @@ var executionSchema = map[string]any{
 			"items": executionActionSchema,
 		},
 	},
-	"required":             []string{"verdict", "reason", "instruction_done", "actions"},
+	"required":             []string{"observation", "previous_step_ok", "verdict", "reason", "instruction_done", "actions"},
 	"additionalProperties": false,
 }
 
@@ -245,6 +260,8 @@ const (
 
 // ExecResult is the executor's judgement of the screen for one step.
 type ExecResult struct {
+	Observation     string // what it sees, in a sentence or two
+	PreviousStepOK  bool   // did the previous step visibly work?
 	Verdict         string
 	Reason          string
 	InstructionDone bool
@@ -287,7 +304,7 @@ func callPlanner(callID string, task Task, action Action, key apiKey) (any, floa
 	}
 
 	response, cost, err := callOpenRouter(callID, "PLANNING", modelForContext(true),
-		plannerSystemPrompt, userContent, "plan", planSchema, plannerOptions(), key)
+		plannerSystemPrompt, userContent, "plan", planSchema, plannerOptions(revise), key)
 	if err != nil {
 		return nil, cost, err
 	}
@@ -328,6 +345,16 @@ func reviseUserText(task Task, files []FileEntry, now time.Time) string {
 	for i := idx; i < len(task.InstructionList); i++ {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, task.InstructionList[i])
 	}
+	if len(task.History) > 0 {
+		b.WriteString("\nWhat actually happened (most recent last) — trust this over the step titles:\n")
+		from := max(len(task.History)-historyForRevise, 0)
+		if from > 0 {
+			fmt.Fprintf(&b, "(%d earlier entries omitted)\n", from)
+		}
+		for _, h := range task.History[from:] {
+			fmt.Fprintf(&b, "- %s\n", h)
+		}
+	}
 	if len(task.Answers) > 0 {
 		b.WriteString("\nUser's answers so far:\n")
 		for _, a := range task.Answers {
@@ -340,6 +367,9 @@ func reviseUserText(task Task, files []FileEntry, now time.Time) string {
 	b.WriteString("\nReturn only the steps still to do, starting from the current screen.")
 	return b.String()
 }
+
+// historyForRevise is how many of the latest history entries a revise sees.
+const historyForRevise = 30
 
 // mentionsFiles is a cheap check for whether a replan reason or an answer
 // is about files or folders — only then is the filesystem list (the
@@ -397,7 +427,7 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 	userContent := []any{
 		map[string]any{
 			"type": "text",
-			"text": executorUserText(task, instruction, idx, w, h),
+			"text": executorUserText(task, instruction, idx, w, h, action.Clipboard),
 		},
 		screenshotContent(action.ScreenshotPayload),
 	}
@@ -423,8 +453,8 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 		res.InstructionDone = false
 	}
 
-	aiLogf("[%s] SUCCESS execution: verdict=%s done=%v reason=%q %d actions: %+v",
-		callID, res.Verdict, res.InstructionDone, res.Reason, len(res.Actions), res.Actions)
+	aiLogf("[%s] SUCCESS execution: saw=%q previousStepOK=%v verdict=%s done=%v reason=%q %d actions: %+v",
+		callID, res.Observation, res.PreviousStepOK, res.Verdict, res.InstructionDone, res.Reason, len(res.Actions), res.Actions)
 
 	return res, cost, nil
 }
@@ -433,7 +463,7 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 // carry out, plus the context needed to judge whether the screen is where
 // the plan expects (E3): the overall task, the whole plan with the current
 // step marked, the previous step, and the user's answers so far.
-func executorUserText(task Task, instruction string, idx int, w, h uint32) string {
+func executorUserText(task Task, instruction string, idx int, w, h uint32, clipboard string) string {
 	final := idx >= len(task.InstructionList)
 	var b strings.Builder
 	if final {
@@ -469,6 +499,9 @@ func executorUserText(task Task, instruction string, idx int, w, h uint32) strin
 		for _, a := range task.Answers {
 			fmt.Fprintf(&b, "- %s\n", a)
 		}
+	}
+	if clipboard != "" {
+		fmt.Fprintf(&b, "\nThe clipboard now contains: «%s»\n", clipboard)
 	}
 	if executionCoords() == coordsNorm1000 {
 		fmt.Fprintf(&b, "\nScreenshot size: %dx%d pixels. Give coordinates normalized to 0–1000, not pixels.", w, h)
@@ -531,6 +564,8 @@ func limitToOneClick(actions []Execution) ([]Execution, int) {
 // list of no-op clicks at (0,0).
 func parseExecResult(response string) (ExecResult, error) {
 	var raw struct {
+		Observation     string      `json:"observation"`
+		PreviousStepOK  *bool       `json:"previous_step_ok"`
 		Verdict         string      `json:"verdict"`
 		Reason          string      `json:"reason"`
 		InstructionDone *bool       `json:"instruction_done"`
@@ -542,9 +577,11 @@ func parseExecResult(response string) (ExecResult, error) {
 	}
 
 	res := ExecResult{
-		Verdict: strings.ToLower(strings.TrimSpace(raw.Verdict)),
-		Reason:  strings.TrimSpace(raw.Reason),
-		Actions: raw.Actions,
+		Observation:    strings.TrimSpace(raw.Observation),
+		PreviousStepOK: raw.PreviousStepOK == nil || *raw.PreviousStepOK,
+		Verdict:        strings.ToLower(strings.TrimSpace(raw.Verdict)),
+		Reason:         strings.TrimSpace(raw.Reason),
+		Actions:        raw.Actions,
 	}
 	if len(res.Actions) == 0 && len(raw.Response) > 0 {
 		res.Actions = raw.Response

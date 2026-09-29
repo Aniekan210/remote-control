@@ -324,6 +324,9 @@ func applyPlan(t Task, p PlanResult, image string) Task {
 	}
 	srvLogf("device=%s: plan set (revise=%v), %d completed + %d new instructions: %v",
 		t.DeviceID, p.Revise, idx, len(p.Instructions), p.Instructions)
+	if p.Revise {
+		t = addHistory(t, fmt.Sprintf("Plan revised from step %d: %s", idx+1, strings.Join(p.Instructions, " / ")))
+	}
 
 	// An empty first plan means there's nothing to execute. Mark the task
 	// COMPLETED instead of leaving it RUNNING with 0 instructions —
@@ -356,6 +359,36 @@ const maxExecutorCallsPerStep = 3
 // whole task is done (COMPLETED); act runs its fix-up actions and checks
 // again (capped like any step); replan/blocked as usual.
 func applyExecResult(t Task, res ExecResult, image string) Task {
+	idx := t.CurrentInstructionIndex
+	if res.Observation != "" {
+		t.Note = res.Observation
+	}
+
+	// The previous step didn't visibly work (the field isn't focused, the
+	// text isn't there, the page didn't open): doing this step on top of
+	// it would build on nothing. Go back and redo it — cheaper and more
+	// precise than a replan — a couple of times before replanning.
+	if !res.PreviousStepOK && idx > 0 && idx <= len(t.InstructionList) &&
+		(res.Verdict == verdictAct || res.Verdict == verdictSkip) {
+		prev := t.InstructionList[idx-1]
+		if t.BackSteps < maxBackSteps {
+			t.BackSteps++
+			t.BackAt = idx
+			t.CurrentInstructionIndex = idx - 1
+			t.ExecutionList = make([]Execution, 0)
+			t.InstrAttempts = 0
+			t.StepActions = nil
+			t.SkipStreak = 0
+			t = addHistory(t, fmt.Sprintf("Step %d %q didn't take effect (%s) — redoing it.", idx, prev, res.Observation))
+			srvLogf("device=%s: previous step %d didn't take effect, redoing it (%d/%d): %s",
+				t.DeviceID, idx, t.BackSteps, maxBackSteps, res.Observation)
+			return t
+		}
+		srvLogf("device=%s: step %d still didn't take effect after %d redos, replanning", t.DeviceID, idx, t.BackSteps)
+		return requestReplan(t, fmt.Sprintf("Step %d (%q) didn't take effect even after redoing it %d times. On screen: %s",
+			idx, prev, t.BackSteps, res.Observation), image)
+	}
+
 	if t.CurrentInstructionIndex >= len(t.InstructionList) {
 		switch res.Verdict {
 		case verdictSkip:
@@ -380,10 +413,13 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 	case verdictAct:
 		t.SkipStreak = 0
 		t.ExecutionList = res.Actions
+		t = addHistory(t, fmt.Sprintf("Step %d %q: %s%s. Saw: %s", idx+1, t.InstructionList[idx],
+			strings.Join(describeActions(res.Actions), ", "), map[bool]string{true: "", false: " (not finished yet)"}[res.InstructionDone], res.Observation))
 		if res.InstructionDone {
 			t.CurrentInstructionIndex++
 			t.InstrAttempts = 0
 			t.StepActions = nil
+			t = madeProgress(t)
 		} else {
 			// The executor will look at this step again; tell it what it
 			// already did so it continues instead of starting over.
@@ -410,10 +446,12 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 			return requestReplan(t, reason, image)
 		}
 		t.SkipStreak++
+		t = addHistory(t, fmt.Sprintf("Step %d %q skipped as already done: %s", idx+1, t.InstructionList[idx], res.Reason))
 		t.ExecutionList = make([]Execution, 0)
 		t.CurrentInstructionIndex++
 		t.InstrAttempts = 0
 		t.StepActions = nil
+		t = madeProgress(t)
 		srvLogf("device=%s: executor skip (%s): instruction already done on screen, now %d/%d",
 			t.DeviceID, res.Reason, t.CurrentInstructionIndex, len(t.InstructionList))
 
@@ -422,8 +460,50 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 		t = requestReplan(t, res.Reason, image)
 
 	case verdictBlocked:
-		srvLogf("device=%s: executor blocked: %s", t.DeviceID, res.Reason)
-		t = askUser(t, "blocked", res.Reason, image)
+		// The executor is the weaker model: it never asks the user
+		// directly. The planner looks at the same screen and either finds
+		// another way or decides "ask" itself.
+		srvLogf("device=%s: executor says blocked, planner to double-check: %s", t.DeviceID, res.Reason)
+		t = requestReplan(t, "The executor thinks this can't be done as asked: "+sentence(res.Reason)+
+			" Check the screenshot yourself. If it really is impossible, decide \"ask\" with a clear question; otherwise find another way.", image)
+	}
+	return t
+}
+
+// maxBackSteps is how often a step is redone because the next step found
+// it hadn't taken effect, before the plan is revised instead.
+const maxBackSteps = 2
+
+// maxHistory bounds the task's history (oldest entries drop off).
+const maxHistory = 80
+
+// addHistory records what happened, for the revise planner.
+func addHistory(t Task, line string) Task {
+	t.History = append(t.History, line)
+	if len(t.History) > maxHistory {
+		t.History = append([]string(nil), t.History[len(t.History)-maxHistory:]...)
+	}
+	return t
+}
+
+// progressToRefill is how many steps must complete after an automatic
+// revise before the revise budget (MAX_AUTO_REPLANS) is refilled. The cap
+// is meant to stop going round in circles on ONE problem; a long task
+// that recovers and moves on shouldn't run out of recoveries for later,
+// unrelated problems.
+const progressToRefill = 2
+
+// madeProgress notes a completed step: enough of them after a revise
+// refills the revise budget, and the step-back guard resets once the step
+// that sent us back has been passed.
+func madeProgress(t Task) Task {
+	t.Progress++
+	if t.Progress >= progressToRefill && t.AutoReplans > 0 {
+		srvLogf("device=%s: %d steps done since the last revise — revise budget refilled", t.DeviceID, t.Progress)
+		t.AutoReplans = 0
+	}
+	if t.BackSteps > 0 && t.CurrentInstructionIndex > t.BackAt {
+		t.BackSteps = 0
 	}
 	return t
 }
@@ -472,6 +552,9 @@ func requestReplan(t Task, reason, image string) Task {
 			t.AutoReplans, sentence(reason)), image)
 	}
 	t.AutoReplans++
+	t.Progress = 0
+	t.BackSteps = 0
+	t = addHistory(t, "Plan revision requested: "+reason)
 	t.Context = true
 	t.ExecutionList = make([]Execution, 0)
 	t.Reason = reason
@@ -549,6 +632,7 @@ func applyAnswer(t Task, answer string, now time.Time) Task {
 		srvLogf("device=%s: per-task caps reset after the user chose to continue", t.DeviceID)
 
 	default:
+		t = addHistory(t, fmt.Sprintf("Asked the user %q — they answered %q", question, answer))
 		t.Answers = append(t.Answers, fmt.Sprintf("Q: %s / A: %s", question, answer))
 		t.Reason = "User answered: " + answer
 		t.Context = true
