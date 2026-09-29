@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -252,6 +253,15 @@ func onAIResult(t Task, r AIResult) Task {
 		// re-sends its ADVANCE for this Seq on resume and a fresh call is
 		// made then.
 		srvLogf("device=%s: dropping AI result, task was %s while the call was in flight", t.DeviceID, t.Status)
+		return t
+
+	case r.Err != nil && !r.Planning && errors.Is(r.Err, errUnusableAnswer):
+		// The executor kept answering in a shape that can't be used. That's
+		// no reason to throw the whole task away: let the planner look at
+		// the screen and re-plan the step.
+		srvLogf("device=%s: executor answers were unusable, replanning instead of stopping: %v", t.DeviceID, r.Err)
+		t = requestReplan(t, "The executor couldn't give a usable answer for this step; look at the screen and re-plan it.", r.Image)
+		t.Seq++
 		return t
 
 	case r.Err != nil:

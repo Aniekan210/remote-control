@@ -186,6 +186,9 @@ Then decide:
   step must wait for something your actions open (e.g. you clicked a menu and
   the item to pick in it isn't visible yet). You'll then see the new screen
   and a list of what you already did: continue from there, never repeat it.
+  If the page or app is still loading (spinner, blank area, the element
+  isn't there yet), act with a single {"type":"WAIT","ms":1500,...} and
+  "instruction_done": false — you'll get a fresh look afterwards.
   With "skip", "replan" or "blocked", leave "actions" empty.
 
 ────────────────────────────────────────

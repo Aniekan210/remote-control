@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -453,7 +454,7 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 	res, err := parseExecResult(response)
 	if err != nil {
 		aiLogf("[%s] FAILED invalid execution result: %v, cleaned response: %s", callID, err, response)
-		return nil, cost, fmt.Errorf("invalid execution result: %w (raw: %s)", err, response)
+		return nil, cost, fmt.Errorf("%w: invalid execution result: %v (raw: %s)", errUnusableAnswer, err, response)
 	}
 	if coords == coordsNorm1000 {
 		res.Actions = norm1000ToPixels(res.Actions, int(w), int(h))
@@ -562,6 +563,15 @@ func limitToOneClick(actions []Execution) ([]Execution, int) {
 	return actions, 0
 }
 
+// loadingWaitMs is how long to wait when the executor says the screen is
+// still loading (act, not done, no actions); the worker then also waits
+// for the screen to settle before the next screenshot.
+const loadingWaitMs = 1500
+
+// errUnusableAnswer marks an executor answer that can't be used even after
+// retries (so it's not worth failing the task over: replan instead).
+var errUnusableAnswer = errors.New("unusable executor answer")
+
 // parseExecResult decodes and validates the executor's output. It is
 // tolerant of the pre-verdict shape ({"response": [...]}), read as "act,
 // step done", so a model that ignores the schema still works.
@@ -611,7 +621,11 @@ func parseExecResult(response string) (ExecResult, error) {
 				res.Verdict = verdictSkip
 				return res, nil
 			}
-			return ExecResult{}, fmt.Errorf("verdict act with no actions")
+			// "Not done, nothing to do yet" is the model waiting for
+			// something to load: make that an explicit wait, then look
+			// again (bounded by the per-step attempt cap).
+			res.Actions = []Execution{{Type: "WAIT", Ms: loadingWaitMs}}
+			return res, nil
 		}
 		for i, e := range res.Actions {
 			switch e.Type {

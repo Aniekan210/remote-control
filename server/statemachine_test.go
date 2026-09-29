@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -497,6 +498,14 @@ func TestStateMachine(t *testing.T) {
 			task = onAIResult(task, exec(task, verdictReplan, false, "another problem"))
 			mustEqual(t, "recovers on its own instead of asking", task.Status, "RUNNING")
 			mustEqual(t, "context", task.Context, true)
+		}},
+
+		{"an unusable executor answer replans instead of killing the task", func(t *testing.T) {
+			task := running(t, "a")
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, AIResult{Seq: task.Seq, Err: fmt.Errorf("%w: bad json", errUnusableAnswer)})
+			mustEqual(t, "still running", task.Status, "RUNNING")
+			mustEqual(t, "replan", task.Context, true)
 		}},
 
 		{"refused CREATE_TASK", func(t *testing.T) {
