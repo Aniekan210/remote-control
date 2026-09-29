@@ -191,8 +191,9 @@ var planSchema = map[string]any{
 				"properties": map[string]any{
 					"text":               map[string]any{"type": "string"},
 					"needs_confirmation": map[string]any{"type": "boolean"},
+					"once":               map[string]any{"type": "boolean"},
 				},
-				"required":             []string{"text", "needs_confirmation"},
+				"required":             []string{"text", "needs_confirmation", "once"},
 				"additionalProperties": false,
 			},
 		},
@@ -216,6 +217,7 @@ type PlanResult struct {
 	Message      string
 	Instructions []string
 	NeedsConfirm []bool
+	Once         []bool // steps that must happen at most once (never redone automatically)
 }
 
 // executionActionSchema is one physical action: exactly the five
@@ -245,8 +247,11 @@ var executionSchema = map[string]any{
 		// observation and previous_step_ok come FIRST on purpose: the model
 		// writes fields in schema order, so it describes the screen and
 		// checks the last step before it commits to a verdict or a click.
-		"observation":      map[string]any{"type": "string"},
-		"previous_step_ok": map[string]any{"type": "boolean"},
+		"observation": map[string]any{"type": "string"},
+		"previous_step": map[string]any{
+			"type": "string",
+			"enum": []string{"ok", "failed", "cant_tell"},
+		},
 		"verdict": map[string]any{
 			"type": "string",
 			"enum": []string{"act", "skip", "replan", "blocked"},
@@ -258,7 +263,7 @@ var executionSchema = map[string]any{
 			"items": executionActionSchema,
 		},
 	},
-	"required":             []string{"observation", "previous_step_ok", "verdict", "reason", "instruction_done", "actions"},
+	"required":             []string{"observation", "previous_step", "verdict", "reason", "instruction_done", "actions"},
 	"additionalProperties": false,
 }
 
@@ -273,7 +278,8 @@ const (
 // ExecResult is the executor's judgement of the screen for one step.
 type ExecResult struct {
 	Observation     string // what it sees, in a sentence or two
-	PreviousStepOK  bool   // did the previous step visibly work?
+	PreviousStepOK  bool   // false only when the previous step visibly did NOT take effect
+	PreviousStep    string // ok / failed / cant_tell, as answered
 	Verdict         string
 	Reason          string
 	InstructionDone bool
@@ -465,8 +471,8 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 		res.InstructionDone = false
 	}
 
-	aiLogf("[%s] SUCCESS execution: saw=%q previousStepOK=%v verdict=%s done=%v reason=%q %d actions: %+v",
-		callID, res.Observation, res.PreviousStepOK, res.Verdict, res.InstructionDone, res.Reason, len(res.Actions), res.Actions)
+	aiLogf("[%s] SUCCESS execution: saw=%q previousStep=%s(ok=%v) verdict=%s done=%v reason=%q %d actions: %+v",
+		callID, res.Observation, res.PreviousStep, res.PreviousStepOK, res.Verdict, res.InstructionDone, res.Reason, len(res.Actions), res.Actions)
 
 	return res, cost, nil
 }
@@ -586,7 +592,8 @@ var errUnusableAnswer = errors.New("unusable executor answer")
 func parseExecResult(response string) (ExecResult, error) {
 	var raw struct {
 		Observation     string      `json:"observation"`
-		PreviousStepOK  *bool       `json:"previous_step_ok"`
+		PreviousStep    string      `json:"previous_step"`    // ok / failed / cant_tell
+		PreviousStepOK  *bool       `json:"previous_step_ok"` // older boolean form
 		Verdict         string      `json:"verdict"`
 		Reason          string      `json:"reason"`
 		InstructionDone *bool       `json:"instruction_done"`
@@ -600,9 +607,19 @@ func parseExecResult(response string) (ExecResult, error) {
 	res := ExecResult{
 		Observation:    strings.TrimSpace(raw.Observation),
 		PreviousStepOK: raw.PreviousStepOK == nil || *raw.PreviousStepOK,
+		PreviousStep:   strings.ToLower(strings.TrimSpace(raw.PreviousStep)),
 		Verdict:        strings.ToLower(strings.TrimSpace(raw.Verdict)),
 		Reason:         strings.TrimSpace(raw.Reason),
 		Actions:        raw.Actions,
+	}
+	// Only a definite "failed" counts as failed: an effect that simply
+	// can't be seen (a photo taken, a sound, a background app closing)
+	// must never make the server redo the step.
+	switch res.PreviousStep {
+	case "failed":
+		res.PreviousStepOK = false
+	case "ok", "cant_tell":
+		res.PreviousStepOK = true
 	}
 	if len(res.Actions) == 0 && len(raw.Response) > 0 {
 		res.Actions = raw.Response
@@ -916,6 +933,7 @@ func parsePlan(response string) (PlanResult, error) {
 		var steps []struct {
 			Text              string `json:"text"`
 			NeedsConfirmation bool   `json:"needs_confirmation"`
+			Once              bool   `json:"once"`
 		}
 		if err := json.Unmarshal(obj.Instructions, &steps); err == nil {
 			plan := PlanResult{
@@ -926,6 +944,7 @@ func parsePlan(response string) (PlanResult, error) {
 				if t := strings.TrimSpace(st.Text); t != "" {
 					plan.Instructions = append(plan.Instructions, t)
 					plan.NeedsConfirm = append(plan.NeedsConfirm, st.NeedsConfirmation)
+					plan.Once = append(plan.Once, st.Once || st.NeedsConfirmation)
 				}
 			}
 			return validatePlan(plan)
@@ -964,6 +983,9 @@ func validatePlan(p PlanResult) (PlanResult, error) {
 		}
 	default:
 		return PlanResult{}, fmt.Errorf("unknown decision %q", p.Decision)
+	}
+	if len(p.Once) != len(p.Instructions) {
+		p.Once = make([]bool, len(p.Instructions))
 	}
 	if len(p.NeedsConfirm) != len(p.Instructions) {
 		p.NeedsConfirm = make([]bool, len(p.Instructions))

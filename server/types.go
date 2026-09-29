@@ -45,6 +45,7 @@ type Task struct {
 	StepActions   []string `json:"-"` // what earlier batches already did for the current instruction (shown to the executor)
 	SkipStreak    int      `json:"-"` // steps skipped in a row with nothing done in between
 	History       []string `json:"-"` // what actually happened, step by step — the revise planner reads it
+	Once          []bool   `json:"-"` // parallel to InstructionList: do-once steps (photo, send, submit, pay, delete, …) are never redone automatically
 	Progress      int      `json:"-"` // steps completed since the last automatic revise
 	BackSteps     int      `json:"-"` // times a step was sent back because the one before it hadn't worked
 	BackAt        int      `json:"-"` // the step index that last sent us back (the guard resets once past it)
