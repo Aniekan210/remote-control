@@ -72,6 +72,8 @@ export type Timeline = {
   lastExecKey?: string;
   /** the reason of a revise in progress */
   revising?: string;
+  /** data: URL of the screen when the task completed */
+  finalImage?: string;
 };
 
 export type TimelineStore = { current: Timeline | null; last: Timeline | null };
@@ -235,6 +237,7 @@ export function reduceTimeline(store: TimelineStore, snap: Task, now: number, in
       costUsd: Math.max(cur.costUsd ?? 0, snap.costUsd),
       answerCount: snap.answers.length,
       activeIndex,
+      finalImage: snap.finalImage || cur.finalImage,
       lastExecKey: execKey || cur.lastExecKey,
       // Remember why a revise is under way: the new plan arrives with the
       // reason already cleared, and the "Plan updated" mark needs it.

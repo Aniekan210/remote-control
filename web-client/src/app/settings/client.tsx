@@ -8,8 +8,10 @@ import { QrScanner } from "@/components/qr-scanner";
 import {
   linkDevice,
   removeOpenRouterKey,
+  saveAIInstructions,
   saveOpenRouterKey,
   unlinkDevice,
+  type InstructionsState,
   type KeyState,
   type LinkState,
 } from "./actions";
@@ -290,6 +292,53 @@ export function ApiKeyCard({ last4, updatedAt }: { last4: string | null; updated
         you expect.
       </p>
     </>
+  );
+}
+
+const INSTRUCTIONS_PLACEHOLDER = `For example:
+- My desktop has no icons and my taskbar auto-hides. Open apps with the Windows key and search; don't look for desktop icons.
+- I use Chrome, signed in to my Google account.
+- My work files are in Documents\\Work.
+- Never close Spotify or any window I have open unless the task says so.`;
+
+/** Standing instructions sent with every AI call, like custom instructions in a chat app. */
+export function InstructionsCard({ initial, max }: { initial: string; max: number }) {
+  const [state, action, pending] = useActionState<InstructionsState, FormData>(saveAIInstructions, null);
+  const [text, setText] = useState(initial);
+  const [saved, setSaved] = useState(initial);
+  useEffect(() => {
+    if (state?.ok) setSaved(text.trim());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
+  const dirty = text.trim() !== saved;
+
+  return (
+    <form action={action} className="space-y-3 rounded-2xl border border-line bg-panel p-4">
+      <textarea
+        name="instructions"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        maxLength={max}
+        rows={8}
+        placeholder={INSTRUCTIONS_PLACEHOLDER}
+        className="w-full resize-y rounded-xl border border-line bg-ink px-3.5 py-3 text-[15px] leading-relaxed text-fg outline-none transition placeholder:text-faint focus:border-line-strong"
+      />
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-mono text-[11px] text-faint">
+          {text.length}/{max}
+        </span>
+        <span className="flex items-center gap-3">
+          {state?.error && <span className="font-mono text-[12px] text-danger">{state.error}</span>}
+          {!dirty && state?.ok && <span className="font-mono text-[12px] text-done">Saved</span>}
+          <button
+            disabled={pending || !dirty}
+            className="h-10 rounded-xl bg-fg px-5 text-[14px] font-medium text-ink transition active:scale-[0.98] disabled:opacity-40"
+          >
+            {pending ? "Saving…" : "Save"}
+          </button>
+        </span>
+      </div>
+    </form>
   );
 }
 

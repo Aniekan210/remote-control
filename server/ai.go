@@ -297,24 +297,15 @@ func isRevise(t Task) bool {
 func callPlanner(callID string, task Task, action Action, key apiKey) (any, float64, error) {
 	revise := isRevise(task)
 
-	// The task description lives on the Task (set at CREATE_TASK), NOT on
-	// this ADVANCE action — an ADVANCE carries no Description, so reading
-	// action.Description here sends the planner an empty task and the
-	// model correctly reports "No task was provided."
-	var text string
+	text := plannerUserText(task, action, revise, time.Now())
 	if revise {
-		text = reviseUserText(task, action.FileSystemPayload, time.Now())
 		aiLogf("[%s] revise request: task=%q reason=%q completed=%d remaining=%d answers=%d",
 			callID, task.Description, task.Reason, min(task.CurrentInstructionIndex, len(task.InstructionList)),
 			max(len(task.InstructionList)-task.CurrentInstructionIndex, 0), len(task.Answers))
 	} else {
-		text = fmt.Sprintf("Task:\n%s\n\nFilesystem (filtered, newest first):\n%s",
-			task.Description, formatFileList(action.FileSystemPayload, time.Now()))
 		aiLogf("[%s] planning request: task=%q filesystemEntries=%d",
 			callID, task.Description, len(action.FileSystemPayload))
 	}
-
-	text += fmt.Sprintf("\n\nScreenshot: %dx%d pixels.", action.ScreenshotPayload.Width, action.ScreenshotPayload.Height)
 
 	userContent := []any{
 		map[string]any{"type": "text", "text": text},
@@ -337,6 +328,26 @@ func callPlanner(callID string, task Task, action Action, key apiKey) (any, floa
 	aiLogf("[%s] SUCCESS planning (revise=%v): decision=%s message=%q %d instructions: %v",
 		callID, revise, plan.Decision, plan.Message, len(plan.Instructions), plan.Instructions)
 	return plan, cost, nil
+}
+
+// plannerUserText is the dynamic part of a planner call: the user's
+// standing instructions, then the first-plan or revise message, then the
+// screenshot size.
+//
+// The task description lives on the Task (set at CREATE_TASK), NOT on the
+// ADVANCE action — an ADVANCE carries no Description, so reading
+// action.Description here sends the planner an empty task and the model
+// correctly reports "No task was provided."
+func plannerUserText(task Task, action Action, revise bool, now time.Time) string {
+	var text string
+	if revise {
+		text = reviseUserText(task, action.FileSystemPayload, now)
+	} else {
+		text = fmt.Sprintf("Task:\n%s\n\nFilesystem (filtered, newest first):\n%s",
+			task.Description, formatFileList(action.FileSystemPayload, now))
+	}
+	text = userNotesBlock(task.UserNotes) + text
+	return text + fmt.Sprintf("\n\nScreenshot: %dx%d pixels.", action.ScreenshotPayload.Width, action.ScreenshotPayload.Height)
 }
 
 // reviseUserText is a revise call's message (B7): kept small on purpose —
@@ -384,6 +395,19 @@ func reviseUserText(task Task, files []FileEntry, now time.Time) string {
 	}
 	b.WriteString("\nReturn only the steps still to do, starting from the current screen.")
 	return b.String()
+}
+
+// userNotesBlock is the user's standing instructions from Settings (how
+// their computer is set up, preferences, things never to do), put at the
+// top of every planner and executor message. They come from the account
+// owner, so unlike text on screen they ARE instructions.
+func userNotesBlock(notes string) string {
+	notes = strings.TrimSpace(notes)
+	if notes == "" {
+		return ""
+	}
+	return "The user's standing instructions — about their computer and how they want things done. Always follow them:\n" +
+		notes + "\n\n---\n\n"
 }
 
 // historyForRevise is how many of the latest history entries a revise sees.
@@ -484,6 +508,7 @@ func callExecutor(callID string, task Task, action Action, key apiKey) (any, flo
 func executorUserText(task Task, instruction string, idx int, w, h uint32, clipboard string) string {
 	final := idx >= len(task.InstructionList)
 	var b strings.Builder
+	b.WriteString(userNotesBlock(task.UserNotes))
 	if final {
 		fmt.Fprintf(&b, "FINAL CHECK: %s\n\n", instruction)
 	} else {
