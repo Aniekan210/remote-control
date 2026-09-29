@@ -76,10 +76,15 @@ FILES
   'Screenshot 1.png' from the Pictures\Screenshots folder." Prefer opening
   it from its folder in File Explorer.
 
-CONFIRMATION
+CONFIRMATION AND DO-ONCE STEPS
 Set "needs_confirmation": true on each step that sends, submits, deletes,
 purchases, posts, or closes unsaved work — the user approves it on their
 phone before it runs. Every other step: false.
+Set "once": true on each step that must not happen twice — repeating it
+would duplicate something: taking a photo, screenshot or recording,
+sending, posting, submitting, paying, deleting, creating or adding an
+item. Such a step is attempted exactly once and never repeated
+automatically. Every other step: false.
 
 DECISION
 - "continue": "instructions" is the plan.
@@ -106,7 +111,7 @@ can make, information only they have, or the task is impossible as asked.
 
 OUTPUT
 Only JSON, no prose, no code fences:
-{"decision": "continue", "message": "", "instructions": [{"text": "...", "needs_confirmation": false}]}
+{"decision": "continue", "message": "", "instructions": [{"text": "...", "needs_confirmation": false, "once": false}]}
 `
 
 // executorPixelCoords is the part of the executor prompt that defines the
@@ -160,13 +165,19 @@ Before anything else, LOOK:
 1. "observation": in one or two sentences, describe what is on screen that
    matters for this step (which app/page, what's focused, what's selected,
    what text is in the relevant field).
-2. "previous_step_ok": did the PREVIOUS step visibly take effect? Be
-   strict — a field that should be focused shows a text cursor or a focus
-   outline; text that should have been typed is visible in the field; a
-   page that should have opened is showing; if a copy was made, the
-   clipboard shown in the message holds the right text. If it did NOT take
-   effect, say false (the previous step is then redone) — don't try to make
-   up for it in this step. If there was no previous step, true.
+2. "previous_step": did the PREVIOUS step take effect?
+   - "ok": you can see it did — a field that should be focused shows a text
+     cursor or a focus outline; typed text is in the field; the page that
+     should have opened is showing; after a copy, the clipboard shown in the
+     message holds the right text. Also "ok" if there was no previous step.
+   - "failed": you can SEE it didn't — the field is empty, the old page is
+     still showing, an error appeared. The previous step is then redone, so
+     only say this when the screen clearly shows it didn't happen.
+   - "cant_tell": its effect wouldn't show on screen (a photo or screenshot
+     taken, a sound played, a small or background app closed, something
+     saved or sent without visible change). This counts as done — NEVER
+     answer "failed" just because you can't see the result.
+   Don't try to make up for a failed previous step in this step.
 Then decide:
 - Small interruptions (cookie banners, popups, "not now" prompts, tooltips):
   clear them in "actions" and continue. That's still "act".
@@ -279,7 +290,7 @@ OUTPUT SCHEMA — STRICT
 Return ONLY a JSON object of exactly this shape:
 
 {"observation": "<what you see that matters for this step>",
- "previous_step_ok": true | false,
+ "previous_step": "ok" | "failed" | "cant_tell",
  "verdict": "act" | "skip" | "replan" | "blocked",
  "reason": "<short reason; required for skip, replan and blocked, else \"\">",
  "instruction_done": true | false,
@@ -368,26 +379,26 @@ KEYBOARD RULES
 EXAMPLES
 ────────────────────────────────────────
 Instruction: "Open Google Chrome."
-{"observation": "…", "previous_step_ok": true, "verdict": "act", "reason": "", "instruction_done": true, "actions": [
+{"observation": "…", "previous_step": "ok", "verdict": "act", "reason": "", "instruction_done": true, "actions": [
   {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "{WIN}", "mouse_hold": false},
   {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "chrome", "mouse_hold": false},
   {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "{ENTER}", "mouse_hold": false}
 ]}
 
 Instruction: "Minimize the current window to reveal the desktop and taskbar."
-{"observation": "…", "previous_step_ok": true, "verdict": "act", "reason": "", "instruction_done": true, "actions": [
+{"observation": "…", "previous_step": "ok", "verdict": "act", "reason": "", "instruction_done": true, "actions": [
   {"type": "KEYBOARD_INPUT", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "{WIN+D}", "mouse_hold": false}
 ]}
 
 Instruction: "Click the Sign in button." (button visible at ~1650,240)
-{"observation": "…", "previous_step_ok": true, "verdict": "act", "reason": "", "instruction_done": true, "actions": [
+{"observation": "…", "previous_step": "ok", "verdict": "act", "reason": "", "instruction_done": true, "actions": [
   {"type": "MOUSE_MOVEMENT", "mouse_pos_x": 1650, "mouse_pos_y": 240, "key_string": "", "mouse_hold": false},
   {"type": "LEFT_CLICK", "mouse_pos_x": 0, "mouse_pos_y": 0, "key_string": "", "mouse_hold": false}
 ]}
 
 Instruction: "Send the connection invite." (LinkedIn shows "You've reached the
 weekly invitation limit")
-{"observation": "A banner says the weekly invitation limit is reached.", "previous_step_ok": true, "verdict": "blocked", "reason": "LinkedIn says you've reached this week's invitation limit, so the invite can't be sent.", "instruction_done": false, "actions": []}
+{"observation": "A banner says the weekly invitation limit is reached.", "previous_step": "ok", "verdict": "blocked", "reason": "LinkedIn says you've reached this week's invitation limit, so the invite can't be sent.", "instruction_done": false, "actions": []}
 
 Return ONLY the JSON object, with no surrounding prose and no markdown code fences.
 `

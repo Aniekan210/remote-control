@@ -94,3 +94,25 @@ func TestLoadingWaitIsAnAction(t *testing.T) {
 		t.Fatalf("got %+v", res)
 	}
 }
+
+func TestCantTellIsNotAFailure(t *testing.T) {
+	for answer, wantOK := range map[string]bool{"ok": true, "cant_tell": true, "failed": false} {
+		res, err := parseExecResult(`{"observation":"camera app","previous_step":"` + answer + `","verdict":"act","reason":"","instruction_done":true,"actions":[{"type":"KEYBOARD_INPUT","key_string":"x","mouse_pos_x":0,"mouse_pos_y":0,"mouse_hold":false,"ms":0}]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.PreviousStepOK != wantOK {
+			t.Errorf("previous_step=%s: ok=%v, want %v", answer, res.PreviousStepOK, wantOK)
+		}
+	}
+}
+
+func TestPlanOnceFlag(t *testing.T) {
+	p, err := parsePlan(`{"decision":"continue","message":"","instructions":[{"text":"Open the camera.","needs_confirmation":false,"once":false},{"text":"Take a photo.","needs_confirmation":false,"once":true},{"text":"Send it.","needs_confirmation":true,"once":false}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Once) != 3 || p.Once[0] || !p.Once[1] || !p.Once[2] {
+		t.Fatalf("once = %v (a step needing confirmation is also do-once)", p.Once)
+	}
+}

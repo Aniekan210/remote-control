@@ -508,6 +508,33 @@ func TestStateMachine(t *testing.T) {
 			mustEqual(t, "replan", task.Context, true)
 		}},
 
+		{"a do-once step is never redone automatically", func(t *testing.T) {
+			task := running(t, "open the camera", "take a photo", "close the camera")
+			task.Once = []bool{false, true, false}
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, true, "", click)) // camera open
+			task = onClientAction(task, advance(task.Seq))
+			// Shutter pressed, but the executor wants "another look": not for a do-once step.
+			task = onAIResult(task, exec(task, verdictAct, false, "", click))
+			mustEqual(t, "one attempt, then move on", task.CurrentInstructionIndex, 2)
+			task = onClientAction(task, advance(task.Seq))
+			// The next step thinks the photo didn't happen: planner decides, no second photo.
+			task = onAIResult(task, execPrevFailed(task, "no new photo visible"))
+			mustEqual(t, "not sent back to the photo step", task.CurrentInstructionIndex, 2)
+			mustEqual(t, "planner reviews", task.Context, true)
+			if !strings.Contains(task.Reason, "NOT repeated") {
+				t.Fatalf("reason = %q", task.Reason)
+			}
+		}},
+
+		{"a loading wait on a do-once step still gets its real attempt", func(t *testing.T) {
+			task := running(t, "take a photo")
+			task.Once = []bool{true}
+			task = onClientAction(task, advance(task.Seq))
+			task = onAIResult(task, exec(task, verdictAct, false, "", Execution{Type: "WAIT", Ms: 1500}))
+			mustEqual(t, "still on the step", task.CurrentInstructionIndex, 0)
+		}},
+
 		{"refused CREATE_TASK", func(t *testing.T) {
 			a := create("x")
 			a.Refused = "Add your OpenRouter key in Settings"

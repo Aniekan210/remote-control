@@ -318,9 +318,12 @@ func applyPlan(t Task, p PlanResult, image string) Task {
 	completed := append([]string{}, t.InstructionList[:idx]...)
 	completedConfirm := make([]bool, idx)
 	copy(completedConfirm, t.NeedsConfirm[:min(idx, len(t.NeedsConfirm))])
+	completedOnce := make([]bool, idx)
+	copy(completedOnce, t.Once[:min(idx, len(t.Once))])
 
 	t.InstructionList = append(completed, p.Instructions...)
 	t.NeedsConfirm = append(completedConfirm, p.NeedsConfirm...)
+	t.Once = append(completedOnce, p.Once...)
 	t.CurrentInstructionIndex = idx
 	t.Context = false // next ADVANCE generates executions, not a new plan
 	t.Reason = ""
@@ -381,6 +384,14 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 	if !res.PreviousStepOK && idx > 0 && idx <= len(t.InstructionList) &&
 		(res.Verdict == verdictAct || res.Verdict == verdictSkip) {
 		prev := t.InstructionList[idx-1]
+		if isOnce(t, idx-1) {
+			// Taking a photo, sending, paying, deleting…: repeating it on a
+			// hunch could do it twice. Never redo it blindly — the planner
+			// reads what actually happened and decides.
+			srvLogf("device=%s: do-once step %d looks undone, but won't be repeated automatically — planner to decide", t.DeviceID, idx)
+			return requestReplan(t, fmt.Sprintf("Step %d (%q) may not have taken effect (%s). It's a do-once step, so it was NOT repeated. Check the history: if it was carried out, continue from here; only plan it again if you're sure it didn't happen.",
+				idx, prev, res.Observation), image)
+		}
 		if t.BackSteps < maxBackSteps {
 			t.BackSteps++
 			t.BackAt = idx
@@ -422,6 +433,12 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 	switch res.Verdict {
 	case verdictAct:
 		t.SkipStreak = 0
+		if isOnce(t, idx) && !res.InstructionDone && doesSomething(res.Actions) {
+			// A do-once step gets one real attempt: asking for "another
+			// look" after pressing the shutter is how a second photo gets
+			// taken. (A pure wait for loading doesn't count.)
+			res.InstructionDone = true
+		}
 		t.ExecutionList = res.Actions
 		t = addHistory(t, fmt.Sprintf("Step %d %q: %s%s. Saw: %s", idx+1, t.InstructionList[idx],
 			strings.Join(describeActions(res.Actions), ", "), map[bool]string{true: "", false: " (not finished yet)"}[res.InstructionDone], res.Observation))
@@ -478,6 +495,21 @@ func applyExecResult(t Task, res ExecResult, image string) Task {
 			" Check the screenshot yourself. If it really is impossible, decide \"ask\" with a clear question; otherwise find another way.", image)
 	}
 	return t
+}
+
+// isOnce reports whether step i must happen at most once.
+func isOnce(t Task, i int) bool {
+	return i >= 0 && i < len(t.Once) && t.Once[i]
+}
+
+// doesSomething reports whether a batch does more than wait.
+func doesSomething(actions []Execution) bool {
+	for _, a := range actions {
+		if a.Type == "LEFT_CLICK" || a.Type == "RIGHT_CLICK" || a.Type == "KEYBOARD_INPUT" {
+			return true
+		}
+	}
+	return false
 }
 
 // maxBackSteps is how often a step is redone because the next step found
