@@ -5,6 +5,7 @@ import { extractDeviceId } from "@/lib/device-id";
 import { IconBack } from "@/components/icons";
 import { getKeyInfo } from "@/lib/openrouter-key";
 import { getInstructions, MAX_INSTRUCTIONS } from "@/lib/instructions";
+import { WORKER_DOWNLOAD_URL } from "@/lib/worker-download";
 import { ApiKeyCard, DeviceCard, DeviceForm, InstructionsCard, SignOutButton } from "./client";
 
 export const dynamic = "force-dynamic";
@@ -59,7 +60,16 @@ export default async function SettingsPage({
               incomingDeviceId={incomingDiffers}
             />
           ) : (
-            <DeviceForm initialDeviceId={incoming ?? ""} />
+            <>
+              <DeviceForm initialDeviceId={incoming ?? ""} />
+              <p className="text-[13px] leading-relaxed text-faint">
+                No worker yet?{" "}
+                <a href={WORKER_DOWNLOAD_URL} target="_blank" rel="noopener noreferrer" className="text-dim underline">
+                  Download it for Windows
+                </a>{" "}
+                on the PC you want to control — it shows the QR code and device ID.
+              </p>
+            </>
           )}
         </Section>
 
