@@ -10,6 +10,7 @@ import { TaskSummary } from "./task-summary";
 import { TopBar } from "./top-bar";
 import { IconMonitor, IconArrowUp, IconChevron } from "./icons";
 import { useControlSocket } from "./use-control-socket";
+import { WORKER_DOWNLOAD_ADDRESS } from "@/lib/worker-download";
 import type { ClientAction, TaskStatus } from "@/lib/task";
 import {
   EMPTY_STORE,
@@ -282,6 +283,10 @@ function WaitingForComputer() {
       <p className="mt-3 max-w-sm text-[15px] leading-relaxed text-dim">
         Start the Remote Control worker on it. This screen connects on its own as soon as it&apos;s
         up.
+      </p>
+      <p className="mt-3 max-w-sm text-[13px] leading-relaxed text-faint">
+        Not installed there? On that PC, open <span className="font-mono text-dim">{WORKER_DOWNLOAD_ADDRESS}</span>{" "}
+        to download it.
       </p>
     </div>
   );
